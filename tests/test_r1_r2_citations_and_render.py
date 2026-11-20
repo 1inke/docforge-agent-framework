@@ -57,7 +57,7 @@ def _complete_review_and_final_approval(
                 "check_id": item["check_id"],
                 "question": item["question"],
                 "verdict": "pass",
-                "rationale": "Checked against drafted prose and cited source excerpt carefully.",
+                "rationale": f"Checked [{item['check_id']}:{item['question'][:20]}] against drafted prose and source excerpt.",
                 "quotes": [q_list[idx % len(q_list)]],
                 "evidence_ids": [bindings[0].evidence_id] if bindings and bindings[0].evidence_id else [],
             }

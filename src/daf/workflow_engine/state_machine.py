@@ -14,6 +14,7 @@ from daf.context_manager.manager import (
     ContextManager,
     compute_canonical_json_hash,
     evaluate_claim_binding_support,
+    resolve_co_evidences,
     resolve_section_word_budget,
 )
 from daf.core.contracts import (
@@ -199,7 +200,12 @@ def assert_semantic_and_claim_reviews_ready(state: ProjectWorkspaceState) -> Non
                 continue
 
             # Run live L2a rule check to ensure no ungrounded metrics_data or quantitative/overclaim conflict
-            det_status, det_reason = evaluate_claim_binding_support(b, ev)
+            det_status, det_reason = evaluate_claim_binding_support(
+                b,
+                ev,
+                co_evidences=resolve_co_evidences(state, b),
+                extra_units=list(state.profile.content_profile.extra_physical_units),
+            )
             if b.rule_check_status == "rule_failed" or det_status in {"unsupported", "partially_supported"}:
                 unsupported_bindings.append(
                     {
@@ -682,8 +688,10 @@ class WorkflowEngine:
         # 6. Parse content_markdown via Pandoc JSON AST and derive bindings + L2a checks
         from daf.core.contracts import ReviewIssue
         from daf.core.pandoc_ast import (
+            CitationClause,
             analyze_markdown_with_pandoc,
             classify_uncited_sentence,
+            detect_table_caption_attribute_syntax,
             hypothesis_has_false_experiment_marker,
         )
 
@@ -693,17 +701,48 @@ class WorkflowEngine:
         derived_claims: list[str] = []
         l2_warnings: list[dict[str, str]] = []
         uncited_issues: list[dict[str, Any]] = []
+        syntax_warnings: list[dict[str, Any]] = []
         extra_units = list(state.profile.content_profile.extra_physical_units)
 
-        # Clear previous open UNCITED_FACTUAL_CLAIM issues for this section before re-evaluating
+        # Clear previous open UNCITED_FACTUAL_CLAIM & syntax caption issues for this section before re-evaluating
         for old_iss in state.review_ledger.issues:
             if (
                 old_iss.target_section_id == section_id
-                and old_iss.category == "UNCITED_FACTUAL_CLAIM"
                 and old_iss.status == "open"
+                and (
+                    old_iss.category == "UNCITED_FACTUAL_CLAIM"
+                    or old_iss.issue_id.startswith("syntax_tbl_cap_")
+                )
             ):
                 old_iss.status = "resolved"
                 old_iss.resolved_in_revision = new_rev
+
+        for idx_cap, tbl_id in enumerate(detect_table_caption_attribute_syntax(submission.content_markdown)):
+            cap_issue_id = f"syntax_tbl_cap_{section_id}_r{new_rev}_{idx_cap:02d}"
+            cap_desc = (
+                f"Section '{section_id}' uses caption attribute syntax ': Caption {{#{tbl_id}}}' which is fragile "
+                f"on Pandoc < 3.8. Prefer fenced-div syntax '::: {{#{tbl_id}}}'."
+            )
+            syntax_warnings.append(
+                {
+                    "issue_id": cap_issue_id,
+                    "code": "TABLE_CAPTION_ATTR_SYNTAX",
+                    "severity": "minor",
+                    "label": tbl_id,
+                    "message": cap_desc,
+                }
+            )
+            state.review_ledger.issues.append(
+                ReviewIssue(
+                    issue_id=cap_issue_id,
+                    target_section_id=section_id,
+                    severity="minor",
+                    category="format_equation",
+                    description=cap_desc,
+                    suggested_fix=f"Wrap table in fenced div '::: {{#{tbl_id}}}' ... ':::' for Pandoc < 3.8 portability.",
+                    status="open",
+                )
+            )
 
         for sent in parsed_sentences:
             if not sent.citation_ids and not sent.is_hypothesis:
@@ -772,53 +811,73 @@ class WorkflowEngine:
                 enriched_bindings.append(b_copy)
                 continue
 
-            # Cited sentence: generate one SourceBinding per cited evidence_id
-            for ev_idx, ev_id in enumerate(sent.citation_ids):
-                ev = state.evidence_ledger.items.get(ev_id)
-                # R-C: nonexistent or L1-unmatched evidence rejects submission
-                if ev is None:
-                    raise ContractValidationError(
-                        f"Section '{section_id}' cites nonexistent evidence_id '{ev_id}'.",
-                        code="EVIDENCE_UNVERIFIED",
-                    )
-                if ev.excerpt_match_status != "matched":
-                    raise ContractValidationError(
-                        f"Section '{section_id}' cites unverified/stale evidence_id '{ev_id}' "
-                        f"(excerpt_match_status={ev.excerpt_match_status}). Unmatched evidence cannot be committed.",
-                        code="EVIDENCE_UNVERIFIED",
-                    )
-                SourcePolicyEvaluator.assert_source(state, ev.source_id, "cite")
+            # Cited sentence: scope R-B checks to each citation clause (supports grouped [@a; @b] and multi-clause)
+            clauses = sent.citation_clauses or [
+                CitationClause(text=sent.text, evidence_ids=list(sent.citation_ids))
+            ]
+            for clause_idx, cl in enumerate(clauses):
+                clause_ev_map: dict[str, Any] = {}
+                for ev_id in cl.evidence_ids:
+                    ev = state.evidence_ledger.items.get(ev_id)
+                    # R-C: nonexistent or L1-unmatched evidence rejects submission
+                    if ev is None:
+                        raise ContractValidationError(
+                            f"Section '{section_id}' cites nonexistent evidence_id '{ev_id}'.",
+                            code="EVIDENCE_UNVERIFIED",
+                        )
+                    if ev.excerpt_match_status != "matched":
+                        raise ContractValidationError(
+                            f"Section '{section_id}' cites unverified/stale evidence_id '{ev_id}' "
+                            f"(excerpt_match_status={ev.excerpt_match_status}). Unmatched evidence cannot be committed.",
+                            code="EVIDENCE_UNVERIFIED",
+                        )
+                    SourcePolicyEvaluator.assert_source(state, ev.source_id, "cite")
+                    clause_ev_map[ev_id] = ev
 
-                suffix = "" if len(sent.citation_ids) == 1 else f"_{ev_idx:02d}"
-                bid = f"{section_id}_s{sent.index:03d}_{sent.sentence_hash[:8]}{suffix}"
-                b_copy = SourceBinding(
-                    binding_id=bid,
-                    section_id=section_id,
-                    section_revision=new_rev,
-                    claim_text=sent.text,
-                    evidence_id=ev_id,
-                    claim_type="research_hypothesis" if sent.is_hypothesis else "experimental_result",
-                    evidence_quote_hash=ev.quote_hash,
-                    semantic_support_status="pending",
-                )
-                sup_status, sup_reason = evaluate_claim_binding_support(b_copy, ev)
-                b_copy.rationale = sup_reason
-                if b_copy.rule_check_status == "rule_failed" or b_copy.support_status in {
-                    "unsupported",
-                    "partially_supported",
-                }:
-                    l2_warnings.append(
-                        {
-                            "binding_id": b_copy.binding_id,
-                            "evidence_id": b_copy.evidence_id,
-                            "rule_check_status": b_copy.rule_check_status,
-                            "support_status": b_copy.support_status,
-                            "rationale": sup_reason,
-                        }
+                for ev_idx, ev_id in enumerate(cl.evidence_ids):
+                    ev = clause_ev_map[ev_id]
+                    co_ids = [cid for cid in cl.evidence_ids if cid != ev_id]
+                    co_evs = [clause_ev_map[cid] for cid in co_ids]
+                    suffix = (
+                        ""
+                        if (len(clauses) == 1 and len(cl.evidence_ids) == 1)
+                        else f"_c{clause_idx:02d}_{ev_idx:02d}"
                     )
-                if ev_id not in bound_evidence_ids:
-                    bound_evidence_ids.append(ev_id)
-                enriched_bindings.append(b_copy)
+                    bid = f"{section_id}_s{sent.index:03d}_{sent.sentence_hash[:8]}{suffix}"
+                    b_copy = SourceBinding(
+                        binding_id=bid,
+                        section_id=section_id,
+                        section_revision=new_rev,
+                        claim_text=cl.text,
+                        evidence_id=ev_id,
+                        co_cited_evidence_ids=co_ids,
+                        claim_type="research_hypothesis" if sent.is_hypothesis else "experimental_result",
+                        evidence_quote_hash=ev.quote_hash,
+                        semantic_support_status="pending",
+                    )
+                    sup_status, sup_reason = evaluate_claim_binding_support(
+                        b_copy,
+                        ev,
+                        co_evidences=co_evs,
+                        extra_units=extra_units,
+                    )
+                    b_copy.rationale = sup_reason
+                    if b_copy.rule_check_status == "rule_failed" or b_copy.support_status in {
+                        "unsupported",
+                        "partially_supported",
+                    }:
+                        l2_warnings.append(
+                            {
+                                "binding_id": b_copy.binding_id,
+                                "evidence_id": b_copy.evidence_id,
+                                "rule_check_status": b_copy.rule_check_status,
+                                "support_status": b_copy.support_status,
+                                "rationale": sup_reason,
+                            }
+                        )
+                    if ev_id not in bound_evidence_ids:
+                        bound_evidence_ids.append(ev_id)
+                    enriched_bindings.append(b_copy)
 
         old_markdown = existing_sec.content_markdown if existing_sec else ""
         diff_lines = list(
@@ -980,6 +1039,7 @@ class WorkflowEngine:
             "source_bindings": [b.model_dump(mode="json") for b in enriched_bindings],
             "l2_claim_support_warnings": l2_warnings,
             "uncited_claim_issues": uncited_issues,
+            "syntax_warnings": syntax_warnings,
             "resolved_issue_ids": resolved_ids,
             "downstream_sections_marked_for_revalidation": downstream_marked,
             "invalidated_approvals": invalidated_approvals,

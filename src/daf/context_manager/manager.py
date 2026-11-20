@@ -201,9 +201,27 @@ def resolve_section_word_budget(
 
 
 
+def resolve_co_evidences(
+    state: ProjectWorkspaceState,
+    binding: SourceBinding,
+) -> list[EvidenceItem]:
+    """Resolve valid matched sibling EvidenceItems co-cited with ``binding`` in the same clause."""
+    items: list[EvidenceItem] = []
+    for cid in getattr(binding, "co_cited_evidence_ids", []) or []:
+        if not cid or cid == binding.evidence_id:
+            continue
+        ev = state.evidence_ledger.items.get(cid)
+        if ev is not None and ev.excerpt_match_status == "matched" and ev.source_reliability != "rejected":
+            items.append(ev)
+    return items
+
+
 def run_claim_rule_checks(
     binding: SourceBinding,
     evidence: EvidenceItem | None,
+    *,
+    co_evidences: list[EvidenceItem] | None = None,
+    extra_units: list[str] | None = None,
 ) -> RuleCheckResult:
     """Execute deterministic L2a rule checks on a SourceBinding.
 
@@ -286,38 +304,80 @@ def run_claim_rule_checks(
             rationale=msg,
         )
 
-    # 1. Check for overclaim / exaggeration markers not present in `evidence.quote_excerpt`
-    excerpt_clean = evidence.quote_excerpt.replace("\\text{", "").replace("}", "").replace("$", "")
+    evidence_pool: list[EvidenceItem] = [evidence]
+    seen_pool_ids = {evidence.evidence_id}
+    for co_ev in co_evidences or []:
+        if (
+            co_ev is not None
+            and co_ev.evidence_id not in seen_pool_ids
+            and co_ev.excerpt_match_status == "matched"
+            and co_ev.source_reliability != "rejected"
+        ):
+            evidence_pool.append(co_ev)
+            seen_pool_ids.add(co_ev.evidence_id)
+
+    def _strip_tex(txt: str) -> str:
+        return txt.replace("\\text{", "").replace("}", "").replace("$", "")
+
+    excerpts_clean = [_strip_tex(ev_item.quote_excerpt) for ev_item in evidence_pool]
+    excerpts_raw = [ev_item.quote_excerpt for ev_item in evidence_pool]
+
+    # 1. Check for overclaim / exaggeration markers not present across the clause evidence pool
     exaggerations = [
-        m for m in OVERCLAIM_MARKERS if m in binding.claim_text and m not in evidence.quote_excerpt
+        m
+        for m in OVERCLAIM_MARKERS
+        if m in binding.claim_text and not any(m in ex_raw for ex_raw in excerpts_raw)
     ]
     if exaggerations:
         conflicts.append(
             f"Overclaim detected: claim_text contains exaggerated/universalized assertions {exaggerations} "
-            f"not supported by the bound excerpt."
+            f"not supported by the bound excerpt(s)."
         )
 
-    # 2. R-B: Every numeric token in `claim_text` must appear with strict digit/dot boundaries in `quote_excerpt`
-    from daf.core.pandoc_ast import extract_numbers_strict, number_present_with_boundary
+    # 2. R-B: Every numeric token in `claim_text` must match number+unit across the bound evidence pool
+    from daf.core.pandoc_ast import extract_number_unit_pairs, number_present_with_boundary
 
-    claim_clean = binding.claim_text.replace("\\text{", "").replace("}", "").replace("$", "")
-    claim_numbers = extract_numbers_strict(claim_clean)
-    mismatched_numbers = [
-        num_val
-        for num_val in claim_numbers
-        if not number_present_with_boundary(num_val, excerpt_clean)
-        and not number_present_with_boundary(num_val, evidence.quote_excerpt)
-    ]
+    claim_clean = _strip_tex(binding.claim_text)
+    claim_pairs = extract_number_unit_pairs(claim_clean, extra_units=extra_units)
+    excerpt_units_by_num: dict[str, set[str]] = {}
+    for ex_clean, ex_raw in zip(excerpts_clean, excerpts_raw):
+        for text_variant in (ex_clean, ex_raw):
+            for e_num, e_unit in extract_number_unit_pairs(text_variant, extra_units=extra_units):
+                if e_unit:
+                    excerpt_units_by_num.setdefault(e_num, set()).add(e_unit)
+
+    mismatched_numbers: list[str] = []
+    unit_conflicts: list[str] = []
+    for num_val, claim_unit in claim_pairs:
+        present = any(
+            number_present_with_boundary(num_val, ex_clean)
+            or number_present_with_boundary(num_val, ex_raw)
+            for ex_clean, ex_raw in zip(excerpts_clean, excerpts_raw)
+        )
+        if not present:
+            if num_val not in mismatched_numbers:
+                mismatched_numbers.append(num_val)
+            continue
+        if claim_unit:
+            ev_units = excerpt_units_by_num.get(num_val, set())
+            if ev_units and claim_unit not in ev_units:
+                unit_conflicts.append(f"'{num_val} {claim_unit}' vs excerpt unit(s) {sorted(ev_units)}")
+
     if mismatched_numbers:
         conflicts.append(
             f"Quantitative conflict detected: claim_text asserts numbers {mismatched_numbers} "
             f"which do not match the bound evidence quote_excerpt with numeric boundaries ('{evidence.quote_excerpt[:100]}')."
         )
+    if unit_conflicts:
+        conflicts.append(
+            "Unit conflict detected: claim asserts numeric unit mismatch "
+            f"{unit_conflicts} against bound evidence ('{evidence.quote_excerpt[:100]}')."
+        )
 
     # 3. Check directional / polarity reversal on quantitative claims
-    if claim_numbers:
-        ev_has_dec = any(m in evidence.quote_excerpt for m in DECREASE_POLARITY_MARKERS)
-        ev_has_inc = any(m in evidence.quote_excerpt for m in INCREASE_POLARITY_MARKERS)
+    if claim_pairs:
+        ev_has_dec = any(m in ex_raw for ex_raw in excerpts_raw for m in DECREASE_POLARITY_MARKERS)
+        ev_has_inc = any(m in ex_raw for ex_raw in excerpts_raw for m in INCREASE_POLARITY_MARKERS)
         cl_has_dec = any(m in binding.claim_text for m in DECREASE_POLARITY_MARKERS)
         cl_has_inc = any(m in binding.claim_text for m in INCREASE_POLARITY_MARKERS)
         if (ev_has_dec and not ev_has_inc and cl_has_inc and not cl_has_dec) or (
@@ -361,6 +421,8 @@ def record_semantic_support_review(
         "hypothesis_proposal",
     ],
     rationale: str = "",
+    co_evidences: list[EvidenceItem] | None = None,
+    extra_units: list[str] | None = None,
 ) -> SemanticSupportReview:
     """Record an L2b semantic support review judgment on a SourceBinding.
 
@@ -368,7 +430,12 @@ def record_semantic_support_review(
     - Cannot override `rule_check_status == "rule_failed"` with a positive `"supported_reviewed"` status.
     - Binds judgment to exact `section_hash`, `evidence.evidence_fingerprint`, and `evidence.evidence_revision`.
     """
-    rule_res = run_claim_rule_checks(binding, evidence)
+    rule_res = run_claim_rule_checks(
+        binding,
+        evidence,
+        co_evidences=co_evidences,
+        extra_units=extra_units,
+    )
     binding.rule_check_status = rule_res.status
 
     if rule_res.status == "rule_failed":
@@ -427,6 +494,9 @@ def record_semantic_support_review(
 def evaluate_claim_binding_support(
     binding: SourceBinding,
     evidence: EvidenceItem | None,
+    *,
+    co_evidences: list[EvidenceItem] | None = None,
+    extra_units: list[str] | None = None,
 ) -> tuple[
     Literal[
         "supported",
@@ -452,7 +522,12 @@ def evaluate_claim_binding_support(
         binding.semantic_support_status = "stale"
         return ("stale", f"Referenced evidence '{evidence.evidence_id}' is stale due to source file update.")
 
-    rule_res = run_claim_rule_checks(binding, evidence)
+    rule_res = run_claim_rule_checks(
+        binding,
+        evidence,
+        co_evidences=co_evidences,
+        extra_units=extra_units,
+    )
     binding.rule_check_status = rule_res.status
 
     if rule_res.status == "rule_failed":

@@ -111,6 +111,32 @@ local pass1 = {
   Table = function(el)
     if el.identifier and el.identifier:match("^tbl:") then
       register_table_caption(el, el.identifier)
+    elseif el.caption and el.caption.long and #el.caption.long > 0 then
+      local cap_str = pandoc.utils.stringify(el.caption)
+      local tid = cap_str:match("{#(tbl:[%w_%-%.]+)}%s*$")
+      if tid then
+        local last_blk = el.caption.long[#el.caption.long]
+        if last_blk and (last_blk.t == "Plain" or last_blk.t == "Para") and last_blk.content then
+          while #last_blk.content > 0 do
+            local tail = last_blk.content[#last_blk.content]
+            if tail.t == "Str" and tail.text:match("{#tbl:") then
+              last_blk.content:remove(#last_blk.content)
+              break
+            elseif tail.t == "Space" or tail.t == "SoftBreak" then
+              last_blk.content:remove(#last_blk.content)
+            else
+              last_blk.content:remove(#last_blk.content)
+              if not pandoc.utils.stringify(el.caption):match("{#tbl:") then
+                break
+              end
+            end
+          end
+          while #last_blk.content > 0 and (last_blk.content[#last_blk.content].t == "Space" or last_blk.content[#last_blk.content].t == "SoftBreak") do
+            last_blk.content:remove(#last_blk.content)
+          end
+        end
+        register_table_caption(el, tid)
+      end
     end
     return el
   end,

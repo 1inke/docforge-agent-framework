@@ -25,6 +25,8 @@ PHYSICAL_UNITS: tuple[str, ...] = (
     "us",
     "μs",
     "ns",
+    "s",
+    "min",
     "Hz",
     "kHz",
     "MHz",
@@ -34,6 +36,9 @@ PHYSICAL_UNITS: tuple[str, ...] = (
     "GB",
     "TB",
     "PB",
+    "M",
+    "G",
+    "T",
     "MB/s",
     "GB/s",
     "ops/s",
@@ -74,6 +79,7 @@ PHYSICAL_UNITS: tuple[str, ...] = (
     "μg",
     "ug",
     "km",
+    "m",
     "cm",
     "mm",
     "nm",
@@ -90,11 +96,29 @@ PHYSICAL_UNITS: tuple[str, ...] = (
     "h",
     "hr",
     "hrs",
+    "px",
+    "pixel",
+    "pixels",
+    "像素",
+    "毫秒",
+    "微秒",
+    "纳秒",
+    "秒",
+    "米",
+    "厘米",
+    "毫米",
+    "千米",
+    "公里",
     "倍",
 )
 
 COUNTING_OR_PLANNING_UNITS: tuple[str, ...] = (
     "年",
+    "个月",
+    "小节",
+    "方面",
+    "阶段",
+    "季度",
     "个",
     "项",
     "次",
@@ -102,8 +126,6 @@ COUNTING_OR_PLANNING_UNITS: tuple[str, ...] = (
     "节",
     "人",
     "篇",
-    "方面",
-    "阶段",
     "步",
     "条",
     "类",
@@ -115,7 +137,6 @@ COUNTING_OR_PLANNING_UNITS: tuple[str, ...] = (
     "天",
     "周",
     "月",
-    "季度",
 )
 
 # Strong comparative/priority markers -> trigger minor alone (do not block release; semantic review checks)
@@ -136,10 +157,21 @@ STRONG_COMPARATIVE_MARKERS: tuple[str, ...] = (
 # Weak comparative markers -> trigger major ONLY when paired with a remaining numeric token
 WEAK_COMPARATIVE_MARKERS: tuple[str, ...] = (
     "降低",
+    "降到",
+    "降至",
     "下降",
     "减少",
+    "减至",
     "提升",
+    "提升到",
+    "提升至",
     "提高",
+    "提高到",
+    "提高至",
+    "增加到",
+    "增至",
+    "压缩到",
+    "压缩至",
     "高于",
     "低于",
     "达到",
@@ -163,8 +195,18 @@ WEAK_COMPARATIVE_MARKERS: tuple[str, ...] = (
     "achieved",
 )
 
-# Planning / goal markers exempt a sentence unless a completed-state marker is also present
+# Planning / goal markers exempt a sentence unless a completed-state marker is also present.
+# Bare "将" is intentionally omitted because Chinese disposal constructions ("该方法将 ...") describe results.
 PLANNING_EXEMPT_MARKERS: tuple[str, ...] = (
+    "拟将",
+    "我们将",
+    "本项目将",
+    "本研究将",
+    "本文将在",
+    "将在",
+    "将会",
+    "将于",
+    "将用于",
     "拟",
     "计划",
     "预期",
@@ -173,7 +215,6 @@ PLANNING_EXEMPT_MARKERS: tuple[str, ...] = (
     "次要目标",
     "旨在",
     "打算",
-    "将",
     "希望",
     "aim to",
     "aims to",
@@ -187,6 +228,14 @@ PLANNING_EXEMPT_MARKERS: tuple[str, ...] = (
 COMPLETED_FACT_MARKERS: tuple[str, ...] = (
     "已",
     "已经",
+    "降低了",
+    "提升了",
+    "提高了",
+    "减少了",
+    "达到了",
+    "压缩了",
+    "缩短了",
+    "实现了",
     "实验表明",
     "实验证明",
     "实测",
@@ -220,10 +269,92 @@ HYPOTHESIS_FALSE_EXPERIMENT_MARKERS: tuple[str, ...] = (
 YEAR_PATTERN = re.compile(r"(?:19|20)\d{2}\s*年?")
 COUNTING_NUM_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_.])\d+(?:\.\d+)?\s*(?:"
-    + "|".join(re.escape(u) for u in COUNTING_OR_PLANNING_UNITS)
+    + "|".join(re.escape(u) for u in sorted(COUNTING_OR_PLANNING_UNITS, key=len, reverse=True))
     + r")(?![A-Za-z0-9_])"
 )
 NUMBER_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z0-9_.])\d+(?:\.\d+)?(?![A-Za-z0-9_.])")
+
+# Measurement units for R-B unit consistency (superset of PHYSICAL_UNITS)
+MEASUREMENT_UNIT_TOKENS: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        list(PHYSICAL_UNITS)
+        + ["mW", "B", "B/s", "KB/s", "TB/s", "sec", "secs", "second", "seconds", "小时"]
+    )
+)
+
+_CANONICAL_UNIT_ALIASES: dict[str, str] = {
+    "％": "%",
+    "℃": "°C",
+    "μs": "us",
+    "微秒": "us",
+    "毫秒": "ms",
+    "纳秒": "ns",
+    "秒": "s",
+    "sec": "s",
+    "secs": "s",
+    "second": "s",
+    "seconds": "s",
+    "hr": "h",
+    "hrs": "h",
+    "小时": "h",
+    "米": "m",
+    "厘米": "cm",
+    "毫米": "mm",
+    "千米": "km",
+    "公里": "km",
+    "μm": "um",
+    "μg": "ug",
+    "μmol": "umol",
+    "像素": "px",
+    "pixel": "px",
+    "pixels": "px",
+    "kb/s": "KB/s",
+    "mb/s": "MB/s",
+    "gb/s": "GB/s",
+    "tb/s": "TB/s",
+    "b/s": "B/s",
+    "ops/s": "ops/s",
+    "hz": "Hz",
+    "khz": "kHz",
+    "mhz": "MHz",
+    "ghz": "GHz",
+    "db": "dB",
+    "dbm": "dBm",
+    "qps": "QPS",
+    "tps": "TPS",
+    "fps": "FPS",
+    "flops": "FLOPS",
+    "gflops": "GFLOPS",
+    "tflops": "TFLOPS",
+}
+
+
+def canonicalize_unit(unit: str) -> str:
+    """Normalize equivalent measurement unit notations while preserving prefix scales (s != ms != us, m != M)."""
+    cleaned = unit.strip()
+    if not cleaned:
+        return ""
+    if cleaned in _CANONICAL_UNIT_ALIASES:
+        return _CANONICAL_UNIT_ALIASES[cleaned]
+    lowered = cleaned.lower()
+    if lowered in _CANONICAL_UNIT_ALIASES:
+        return _CANONICAL_UNIT_ALIASES[lowered]
+    return cleaned
+
+
+def _build_unit_prefix_regex(extra_units: list[str] | None = None) -> re.Pattern[str]:
+    units = list(MEASUREMENT_UNIT_TOKENS)
+    if extra_units:
+        for u in extra_units:
+            cleaned = str(u).strip()
+            if cleaned and cleaned not in units:
+                units.append(cleaned)
+    ordered = sorted(units, key=len, reverse=True)
+    escaped = "|".join(re.escape(u) for u in ordered)
+    return re.compile(rf"^\s*({escaped})(?![A-Za-z0-9_])", re.IGNORECASE)
+
+
+DEFAULT_UNIT_PREFIX_PATTERN = _build_unit_prefix_regex()
 
 
 def _build_physical_unit_regex(extra_units: list[str] | None = None) -> re.Pattern[str]:
@@ -258,6 +389,12 @@ class ASTStats:
 
 
 @dataclass
+class CitationClause:
+    text: str
+    evidence_ids: list[str]
+
+
+@dataclass
 class ParsedSentence:
     index: int
     text: str
@@ -265,6 +402,7 @@ class ParsedSentence:
     crossref_ids: list[str]
     is_hypothesis: bool
     sentence_hash: str
+    citation_clauses: list[CitationClause] = field(default_factory=list)
 
 
 def find_pandoc_binary() -> str | None:
@@ -326,7 +464,26 @@ def _record_label(ident: Any, stats: ASTStats) -> None:
         stats.defined_labels.append(ident)
 
 
-def _inline_to_text_and_cites(inlines: list[Any], stats: ASTStats) -> tuple[str, list[str]]:
+def _clean_sentence_text(raw_text: str) -> str:
+    cleaned = CITE_TOKEN_RE.sub("", raw_text)
+    cleaned = re.sub(r"\s+([。！？!?；;，,])", r"\1", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned.strip()
+
+
+CITE_TOKEN_RE = re.compile(r"\uE000CITE:(\d+)\uE001")
+TABLE_CAPTION_ATTR_RE = re.compile(r"(?m)^\s*:\s+.*?\{#(tbl:[A-Za-z0-9_.\-:]+)\}")
+_PREFIX_CUE_RE = re.compile(
+    r"(?:根据|据|如|见|参照|按照|依据|参考文献|according\s+to|per|in|from)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _inline_to_text_and_cites(
+    inlines: list[Any],
+    stats: ASTStats,
+    cite_tokens: list[list[str]],
+) -> tuple[str, list[str]]:
     parts: list[str] = []
     cites: list[str] = []
     for node in inlines:
@@ -363,42 +520,49 @@ def _inline_to_text_and_cites(inlines: list[Any], stats: ASTStats) -> tuple[str,
                                 stats.crossref_targets.append(cid)
                         elif cid != "hypothesis":
                             stats.citations.append(cid)
-                        ids_here.append(f"@{cid}")
+                        ids_here.append(cid)
                 if ids_here:
-                    parts.append("[" + "; ".join(ids_here) + "]")
+                    tok_idx = len(cite_tokens)
+                    cite_tokens.append(ids_here)
+                    # Sentinel without punctuation guarantees sentence splitters never split inside [@a; @b]
+                    parts.append(f"\uE000CITE:{tok_idx}\uE001")
         elif t == "Image":
             stats.images += 1
             if isinstance(c, list) and len(c) >= 1 and isinstance(c[0], list) and c[0]:
                 _record_label(c[0][0], stats)
             if isinstance(c, list) and len(c) >= 2 and isinstance(c[1], list):
-                sub_text, sub_cites = _inline_to_text_and_cites(c[1], stats)
+                sub_text, sub_cites = _inline_to_text_and_cites(c[1], stats, cite_tokens)
                 parts.append(sub_text)
                 cites.extend(sub_cites)
         elif t in {"Emph", "Strong", "Strikeout", "Superscript", "Subscript", "SmallCaps"}:
             if isinstance(c, list):
-                sub_text, sub_cites = _inline_to_text_and_cites(c, stats)
+                sub_text, sub_cites = _inline_to_text_and_cites(c, stats, cite_tokens)
                 parts.append(sub_text)
                 cites.extend(sub_cites)
         elif t == "Quoted":
             if isinstance(c, list) and len(c) >= 2 and isinstance(c[1], list):
-                sub_text, sub_cites = _inline_to_text_and_cites(c[1], stats)
+                sub_text, sub_cites = _inline_to_text_and_cites(c[1], stats, cite_tokens)
                 parts.append(sub_text)
                 cites.extend(sub_cites)
         elif t in {"Link", "Span"}:
             if t == "Span" and isinstance(c, list) and len(c) >= 1 and isinstance(c[0], list) and c[0]:
                 _record_label(c[0][0], stats)
             if isinstance(c, list) and len(c) >= 2 and isinstance(c[1], list):
-                sub_text, sub_cites = _inline_to_text_and_cites(c[1], stats)
+                sub_text, sub_cites = _inline_to_text_and_cites(c[1], stats, cite_tokens)
                 parts.append(sub_text)
                 cites.extend(sub_cites)
         elif t == "Note":
             if isinstance(c, list):
-                sub_blocks_text = _extract_blocks_plain_segments(c, stats)
+                sub_blocks_text = _extract_blocks_plain_segments(c, stats, cite_tokens)
                 parts.append(" ".join(sub_blocks_text))
     return "".join(parts), cites
 
 
-def _extract_blocks_plain_segments(blocks: list[Any], stats: ASTStats) -> list[str]:
+def _extract_blocks_plain_segments(
+    blocks: list[Any],
+    stats: ASTStats,
+    cite_tokens: list[list[str]],
+) -> list[str]:
     segments: list[str] = []
     for block in blocks:
         if not isinstance(block, dict):
@@ -406,7 +570,7 @@ def _extract_blocks_plain_segments(blocks: list[Any], stats: ASTStats) -> list[s
         t = block.get("t")
         c = block.get("c")
         if t in {"Para", "Plain"} and isinstance(c, list):
-            txt, _ = _inline_to_text_and_cites(c, stats)
+            txt, _ = _inline_to_text_and_cites(c, stats, cite_tokens)
             if txt.strip():
                 segments.append(txt.strip())
         elif t == "Header":
@@ -415,42 +579,116 @@ def _extract_blocks_plain_segments(blocks: list[Any], stats: ASTStats) -> list[s
                 _record_label(c[1][0], stats)
         elif t == "Table":
             stats.tables += 1
-            if isinstance(c, list) and len(c) >= 1 and isinstance(c[0], list) and c[0]:
-                _record_label(c[0][0], stats)
+            tbl_id = c[0][0] if (isinstance(c, list) and len(c) >= 1 and isinstance(c[0], list) and c[0]) else ""
+            _record_label(tbl_id, stats)
             if isinstance(c, list) and len(c) >= 2 and isinstance(c[1], list) and len(c[1]) >= 2:
                 cap_blocks = c[1][1]
                 if isinstance(cap_blocks, list):
-                    _extract_blocks_plain_segments(cap_blocks, stats)
+                    cap_segs = _extract_blocks_plain_segments(cap_blocks, stats, cite_tokens)
+                    if not tbl_id:
+                        m = re.search(r"\{#(tbl:[A-Za-z0-9_.\-:]+)\}", " ".join(cap_segs))
+                        if m:
+                            _record_label(m.group(1), stats)
         elif t == "Figure":
             if isinstance(c, list) and len(c) >= 1 and isinstance(c[0], list) and c[0]:
                 _record_label(c[0][0], stats)
             if isinstance(c, list) and len(c) >= 3 and isinstance(c[2], list):
-                _extract_blocks_plain_segments(c[2], stats)
+                _extract_blocks_plain_segments(c[2], stats, cite_tokens)
         elif t in {"BulletList", "OrderedList"}:
             items = c if t == "BulletList" else (c[1] if isinstance(c, list) and len(c) >= 2 else [])
             if isinstance(items, list):
                 for item_blocks in items:
                     if isinstance(item_blocks, list):
-                        segments.extend(_extract_blocks_plain_segments(item_blocks, stats))
+                        segments.extend(_extract_blocks_plain_segments(item_blocks, stats, cite_tokens))
         elif t == "BlockQuote" and isinstance(c, list):
-            segments.extend(_extract_blocks_plain_segments(c, stats))
+            segments.extend(_extract_blocks_plain_segments(c, stats, cite_tokens))
         elif t == "Div" and isinstance(c, list) and len(c) >= 2:
             if isinstance(c[0], list) and c[0]:
                 _record_label(c[0][0], stats)
             if isinstance(c[1], list):
-                segments.extend(_extract_blocks_plain_segments(c[1], stats))
+                segments.extend(_extract_blocks_plain_segments(c[1], stats, cite_tokens))
     return segments
 
 
-INLINE_CITE_BRACKET_RE = re.compile(r"\[((?:@[A-Za-z0-9_.\-:]+)(?:\s*;\s*@[A-Za-z0-9_.\-:]+)*)\]")
+def _extract_citation_clauses(
+    raw_sentence: str,
+    cite_tokens: list[list[str]],
+    clean_sentence: str,
+) -> list[CitationClause]:
+    """Scope each distinct citation group inside a sentence to its own clause text."""
+    raw_tokens: list[tuple[int, int, list[str]]] = []
+    for m in CITE_TOKEN_RE.finditer(raw_sentence):
+        tok_idx = int(m.group(1))
+        raw_ids = cite_tokens[tok_idx] if 0 <= tok_idx < len(cite_tokens) else []
+        ev_here = list(
+            dict.fromkeys(cid for cid in raw_ids if cid != "hypothesis" and not is_crossref_id(cid))
+        )
+        raw_tokens.append((m.start(), m.end(), ev_here))
+
+    if not any(ev_here for _, _, ev_here in raw_tokens):
+        return []
+
+    ev_spans = [(s, e, ids) for (s, e, ids) in raw_tokens if ids]
+    raw_segs: list[str] = []
+    last = 0
+    for s, e, _ in ev_spans:
+        seg = CITE_TOKEN_RE.sub("", raw_sentence[last:s])
+        raw_segs.append(seg)
+        last = e
+    raw_segs.append(CITE_TOKEN_RE.sub("", raw_sentence[last:]))
+
+    merged_segs: list[str] = [raw_segs[0]]
+    merged_groups: list[list[str]] = []
+    for idx, (_s, _e, ids) in enumerate(ev_spans):
+        seg_before = raw_segs[idx]
+        if idx > 0 and re.sub(r"[\s,，、;；:：]+", "", seg_before) == "":
+            merged_groups[-1] = list(dict.fromkeys([*merged_groups[-1], *ids]))
+        else:
+            if merged_groups:
+                merged_segs.append(seg_before)
+            merged_groups.append(list(ids))
+    merged_segs.append(raw_segs[-1])
+
+    if len(merged_groups) == 1:
+        return [CitationClause(text=clean_sentence, evidence_ids=merged_groups[0])]
+
+    def _strip_clause(text: str) -> str:
+        t = re.sub(r"\s+([。！？!?；;，,])", r"\1", text)
+        t = re.sub(r"[ \t]{2,}", " ", t).strip()
+        return t.strip(" \t\r\n,，、;；:：")
+
+    cleaned_segs = [_strip_clause(s) for s in merged_segs]
+    seg0 = cleaned_segs[0]
+    trailing = cleaned_segs[-1]
+    trailing_nonpunct = trailing.strip("。！？!?. ")
+    use_prefix = (
+        (not seg0 or (not NUMBER_TOKEN_PATTERN.search(seg0) and bool(_PREFIX_CUE_RE.search(seg0))))
+        and bool(trailing_nonpunct)
+    )
+
+    clauses: list[CitationClause] = []
+    if use_prefix:
+        for i, ids in enumerate(merged_groups):
+            txt = cleaned_segs[i + 1]
+            if i == 0 and seg0:
+                txt = f"{seg0} {txt}".strip() if txt else seg0
+            clauses.append(CitationClause(text=txt or clean_sentence, evidence_ids=ids))
+    else:
+        for i, ids in enumerate(merged_groups):
+            txt = cleaned_segs[i]
+            if i == len(merged_groups) - 1 and trailing_nonpunct:
+                txt = f"{txt} {trailing}".strip() if txt else trailing
+            clauses.append(CitationClause(text=txt or clean_sentence, evidence_ids=ids))
+    return clauses
 
 
 def analyze_markdown_with_pandoc(markdown: str) -> tuple[list[ParsedSentence], ASTStats, dict[str, Any]]:
-    """Parse markdown via Pandoc JSON AST and extract sentences, citations, crossrefs, and labels."""
+    """Parse markdown via Pandoc JSON AST and extract sentences, citations, clauses, crossrefs, and labels."""
     ast = parse_markdown_to_ast(markdown)
     stats = ASTStats()
+    cite_tokens: list[list[str]] = []
     blocks = ast.get("blocks", []) if isinstance(ast, dict) else []
-    segments = _extract_blocks_plain_segments(blocks, stats)
+    segments = _extract_blocks_plain_segments(blocks, stats, cite_tokens)
 
     sentences: list[ParsedSentence] = []
     idx = 0
@@ -461,17 +699,17 @@ def analyze_markdown_with_pandoc(markdown: str) -> tuple[list[ParsedSentence], A
             if not s:
                 continue
             found_ids: list[str] = []
-            for m in INLINE_CITE_BRACKET_RE.finditer(s):
-                for token in m.group(1).split(";"):
-                    cid = token.strip().lstrip("@")
-                    if cid:
-                        found_ids.append(cid)
+            for m in CITE_TOKEN_RE.finditer(s):
+                tok_idx = int(m.group(1))
+                if 0 <= tok_idx < len(cite_tokens):
+                    found_ids.extend(cite_tokens[tok_idx])
             is_hyp = "hypothesis" in found_ids
             xref_ids = list(dict.fromkeys(cid for cid in found_ids if is_crossref_id(cid)))
             ev_ids = list(
                 dict.fromkeys(cid for cid in found_ids if cid != "hypothesis" and not is_crossref_id(cid))
             )
-            clean_text = INLINE_CITE_BRACKET_RE.sub("", s).strip()
+            clean_text = _clean_sentence_text(s)
+            clauses = _extract_citation_clauses(s, cite_tokens, clean_text)
             shash = hashlib.sha256(clean_text.encode("utf-8")).hexdigest()
             sentences.append(
                 ParsedSentence(
@@ -481,11 +719,23 @@ def analyze_markdown_with_pandoc(markdown: str) -> tuple[list[ParsedSentence], A
                     crossref_ids=xref_ids,
                     is_hypothesis=is_hyp,
                     sentence_hash=shash,
+                    citation_clauses=clauses,
                 )
             )
             idx += 1
 
     return sentences, stats, ast
+
+
+def detect_table_caption_attribute_syntax(markdown: str) -> list[str]:
+    """Detect `: Caption {#tbl:id}` table attribute syntax (fragile on Pandoc < 3.8); returns sorted unique labels."""
+    no_code = re.sub(r"```[\s\S]*?```", "", markdown)
+    labels: list[str] = []
+    for m in TABLE_CAPTION_ATTR_RE.finditer(no_code):
+        tid = m.group(1)
+        if tid not in labels:
+            labels.append(tid)
+    return labels
 
 
 def classify_uncited_sentence(
@@ -531,6 +781,21 @@ def sentence_needs_citation(sentence_text: str, extra_units: list[str] | None = 
 def extract_numbers_strict(text: str) -> list[str]:
     """Extract numeric tokens with strict digit/dot boundaries."""
     return NUMBER_TOKEN_PATTERN.findall(text)
+
+
+def extract_number_unit_pairs(
+    text: str,
+    extra_units: list[str] | None = None,
+) -> list[tuple[str, str]]:
+    """Extract (number, canonical_unit) pairs with strict numeric boundaries and immediate following unit."""
+    unit_prefix_re = _build_unit_prefix_regex(extra_units) if extra_units else DEFAULT_UNIT_PREFIX_PATTERN
+    pairs: list[tuple[str, str]] = []
+    for m in NUMBER_TOKEN_PATTERN.finditer(text):
+        num = m.group(0)
+        um = unit_prefix_re.match(text[m.end() :])
+        canon_unit = canonicalize_unit(um.group(1)) if um else ""
+        pairs.append((num, canon_unit))
+    return pairs
 
 
 def number_present_with_boundary(number_str: str, excerpt: str) -> bool:

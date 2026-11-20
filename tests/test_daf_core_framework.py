@@ -265,7 +265,7 @@ def test_end_to_end_template_agnostic_workflow(tmp_path: Path) -> None:
                     "check_id": item["check_id"],
                     "question": item["question"],
                     "verdict": "pass",
-                    "rationale": "Verified against current section text and evidence.",
+                    "rationale": f"Verified [{item['check_id']}:{item['question'][:20]}] against section text and evidence.",
                     "quotes": [quote_by_sec[sec_id]],
                     "section_locations": [sec_id],
                     "evidence_ids": ["ev_01"],

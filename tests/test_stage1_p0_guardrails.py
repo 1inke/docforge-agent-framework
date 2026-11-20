@@ -263,7 +263,7 @@ def test_p0_2_profile_lock_agent_note_and_independent_review(tmp_path: Path) -> 
                 "check_id": item["check_id"],
                 "question": item["question"],
                 "verdict": "pass",
-                "rationale": "Metrics match benchmark excerpt.",
+                "rationale": f"Verified [{item['check_id']}:{item['question'][:20]}] against benchmark excerpt.",
                 "quotes": ["baseline latency is 18.4 ms across 15 nodes and optimized latency is 9.2 ms"],
                 "evidence_ids": ["ev_01"],
             }
@@ -319,7 +319,7 @@ def test_p0_3_local_ui_token_and_stale_hash_and_cli_approvals(tmp_path: Path) ->
                 "check_id": item["check_id"],
                 "question": item["question"],
                 "verdict": "pass",
-                "rationale": "Verified metrics against live benchmark excerpt in section.",
+                "rationale": f"Verified [{item['check_id']}:{item['question'][:20]}] metrics against live excerpt.",
                 "quotes": ["Baseline latency is 18.4 ms across 15 nodes"],
                 "evidence_ids": ["ev_01"],
             }

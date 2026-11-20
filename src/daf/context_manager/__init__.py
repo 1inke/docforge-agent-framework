@@ -6,6 +6,7 @@ from daf.context_manager.manager import (
     measure_serialized_json_chars,
     normalize_for_verification,
     record_semantic_support_review,
+    resolve_co_evidences,
     resolve_section_word_budget,
     run_claim_rule_checks,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "measure_serialized_json_chars",
     "normalize_for_verification",
     "record_semantic_support_review",
+    "resolve_co_evidences",
     "resolve_section_word_budget",
     "run_claim_rule_checks",
 ]

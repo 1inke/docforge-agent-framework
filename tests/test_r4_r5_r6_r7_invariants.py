@@ -189,7 +189,7 @@ sections:
             "reviewed_by": "reviewer-02",
             "checklist_hash": t["checklist_hash"],
             "claim_evaluations": ce,
-            "checklist_results": [{"check_id": c["check_id"], "question": c["question"], "verdict": "pass", "rationale": "Substantive rationale verified against text.", "quotes": [distinct_quotes[i]]} for i, c in enumerate(t["checklist_items"])],
+            "checklist_results": [{"check_id": c["check_id"], "question": c["question"], "verdict": "pass", "rationale": f"Verified item {i} ({c['question'][:20]}) against section quote.", "quotes": [distinct_quotes[i]]} for i, c in enumerate(t["checklist_items"])],
         },
     )
     assert ok_res["status"] == "accepted"
@@ -365,7 +365,7 @@ def test_http_api_error_mappings_and_local_ui_bibliography_routes(tmp_path: Path
     t = rv["claimed_tasks"][0]
     st = eng.store.load_state("h1")
     bindings = st.section_versions.sections["s1"].source_bindings
-    eng.call_agent_tool("submit_review", {"project_id": "h1", "task_id": t["task_id"], "section_revision": t["target_section_revision"], "context_fingerprint": t["target_context_fingerprint"], "findings": [], "review_summary": "OK", "recommendation": "approve", "reviewed_by": "reviewer-02", "claim_evaluations": [{"binding_id": bindings[0].binding_id, "semantic_support_status": "supported", "rationale": "Verified numeric throughput against excerpt."}], "checklist_results": [{"check_id": c["check_id"], "question": c["question"], "verdict": "pass", "rationale": "Throughput properly grounded in source evidence.", "quotes": ["实测吞吐为 3.2 GB/s[@ev1]。"]} for c in t["checklist_items"]], "checklist_hash": t["checklist_hash"]})
+    eng.call_agent_tool("submit_review", {"project_id": "h1", "task_id": t["task_id"], "section_revision": t["target_section_revision"], "context_fingerprint": t["target_context_fingerprint"], "findings": [], "review_summary": "OK", "recommendation": "approve", "reviewed_by": "reviewer-02", "claim_evaluations": [{"binding_id": bindings[0].binding_id, "semantic_support_status": "supported", "rationale": "Verified numeric throughput against excerpt."}], "checklist_results": [{"check_id": c["check_id"], "question": c["question"], "verdict": "pass", "rationale": f"Throughput item {idx} ({c['question'][:18]}) grounded in source evidence.", "quotes": ["实测吞吐为 3.2 GB/s[@ev1]。"]} for idx, c in enumerate(t["checklist_items"])], "checklist_hash": t["checklist_hash"]})
     freq = eng.call_agent_tool("request_approval", {"project_id": "h1", "artifact_type": "final_draft"})
     eng.decide_approval_by_human("h1", freq["approval_request_id"], "approved", confirmation_channel="local_cli")
 

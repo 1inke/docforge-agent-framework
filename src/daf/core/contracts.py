@@ -390,6 +390,7 @@ class SourceBinding(StrictContractModel):
         "methodological_choice",
     ] = "experimental_result"
     evidence_id: str = ""
+    co_cited_evidence_ids: list[str] = Field(default_factory=list)
     evidence_quote_hash: str = ""
     rule_check_status: Literal["rule_passed", "rule_failed", "needs_manual_check"] = "rule_passed"
     semantic_support_status: Literal[

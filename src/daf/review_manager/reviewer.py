@@ -12,6 +12,7 @@ from daf.context_manager.manager import (
     evaluate_claim_binding_support,
     normalize_for_verification,
     record_semantic_support_review,
+    resolve_co_evidences,
     resolve_section_word_budget,
     run_claim_rule_checks,
 )
@@ -31,7 +32,10 @@ from daf.core.errors import (
     SemanticReviewRequiredError,
     SemanticReviewStaleError,
 )
-from daf.core.pandoc_ast import analyze_markdown_with_pandoc
+from daf.core.pandoc_ast import (
+    analyze_markdown_with_pandoc,
+    detect_table_caption_attribute_syntax,
+)
 from daf.guidance.policy import SourcePolicyEvaluator
 from daf.workflow_engine.state_machine import count_effective_words, effective_section_ids
 
@@ -183,6 +187,7 @@ class ReviewManager:
             s.section_id: s for s in state.profile.structure_profile.optional_sections
         }
         outline_map = {n.section_id: n for n in state.outline_graph.nodes}
+        extra_units = list(state.profile.content_profile.extra_physical_units)
 
         for sec_id in sections_to_check:
             rule = required_map.get(sec_id) or optional_map.get(sec_id)
@@ -298,7 +303,12 @@ class ReviewManager:
                     )
                     continue
 
-                det_status, det_reason = evaluate_claim_binding_support(binding, ev)
+                det_status, det_reason = evaluate_claim_binding_support(
+                    binding,
+                    ev,
+                    co_evidences=resolve_co_evidences(state, binding),
+                    extra_units=extra_units,
+                )
                 binding.rationale = det_reason
 
                 if binding.rule_check_status == "rule_failed" or det_status in {"unsupported", "partially_supported", "stale"}:
@@ -345,6 +355,18 @@ class ReviewManager:
                     sec_id=sec_id,
                     description=f"Section '{sec_id}' has unbalanced inline '$' math delimiters.",
                     suggested_fix="Ensure every inline LaTeX formula is enclosed in balanced '$...$' delimiters.",
+                )
+
+            for tbl_id in detect_table_caption_attribute_syntax(text):
+                add_issue(
+                    severity="minor",
+                    category="format_equation",
+                    sec_id=sec_id,
+                    description=(
+                        f"Section '{sec_id}' uses caption attribute syntax ': Caption {{#{tbl_id}}}' "
+                        f"which is fragile on Pandoc < 3.8. Prefer fenced-div syntax '::: {{#{tbl_id}}}'."
+                    ),
+                    suggested_fix=f"Wrap table in fenced div '::: {{#{tbl_id}}}' ... ':::' for Pandoc < 3.8 portability.",
                 )
 
             # Record deterministic rule check revision (distinct from accepted semantic review!)
@@ -547,7 +569,7 @@ class ReviewManager:
         sec_id = task.section_id
         sec_state = state.section_versions.sections.get(sec_id)
         eff_author = (sec_state.author_session or "").strip() if sec_state is not None else ""
-        if sec_state is not None and (len(eff_author) < 3 or eff_author == eff_reviewer):
+        if sec_state is not None and (len(eff_author) < 3 or eff_author.casefold() == eff_reviewer.casefold()):
             raise ContractValidationError(
                 f"Reviewer '{eff_reviewer}' cannot review section '{sec_id}' (missing/invalid or matching author_session '{eff_author}').",
                 code="REVIEWER_IS_AUTHOR",
@@ -622,7 +644,7 @@ class ReviewManager:
                 details={"task_id": task_id, "section_id": sec_id},
             )
         eff_author = (sec_state.author_session or "").strip()
-        if len(eff_author) < 3 or eff_author == eff_reviewer:
+        if len(eff_author) < 3 or eff_author.casefold() == eff_reviewer.casefold():
             raise ContractValidationError(
                 f"Reviewer '{eff_reviewer}' cannot submit review for section '{sec_id}' (missing/invalid or matching author_session '{eff_author}').",
                 code="REVIEWER_IS_AUTHOR",
@@ -841,6 +863,22 @@ class ReviewManager:
                     task.status = "rejected"
                     task.rejection_reason = (
                         f"Checklist has {len(active_quoted_items)} non-N/A items (>3); all items cannot cite the same single quote."
+                    )
+                    raise ReviewChecklistIncompleteError(
+                        task.rejection_reason,
+                        details={"task_id": task_id, "checklist_count": len(active_quoted_items)},
+                    )
+            if len(active_quoted_items) >= 2:
+                distinct_rationales = {
+                    normalize_for_verification(r.rationale)
+                    for r in active_quoted_items
+                    if normalize_for_verification(r.rationale)
+                }
+                if len(distinct_rationales) <= 1:
+                    task.status = "rejected"
+                    task.rejection_reason = (
+                        f"Checklist has {len(active_quoted_items)} non-N/A items; "
+                        "all items cannot share the exact same rationale."
                     )
                     raise ReviewChecklistIncompleteError(
                         task.rejection_reason,
@@ -1111,6 +1149,8 @@ class ReviewManager:
                     reviewer=report.reviewer_agent,
                     semantic_status=sem_status,  # type: ignore[arg-type]
                     rationale=rationale,
+                    co_evidences=resolve_co_evidences(state, target_binding),
+                    extra_units=list(state.profile.content_profile.extra_physical_units),
                 )
             except ContractValidationError as exc:
                 # Rule conflict: create conflict ReviewIssue and reject report override (§6.4)

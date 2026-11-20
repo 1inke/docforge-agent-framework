@@ -6,3 +6,14 @@ major|Latency dropped to 4.1 ms under steady load.
 minor|本方法优于现有方法。
 minor|首次实现高精度密集人群识别。
 minor|The proposed scheduler outperforms FIFO baselines.
+
+major|现有方法在 ETH 数据集上的 ADE 为 0.39 m。
+major|Social-LSTM 的推理时延约为 20 ms。
+major|该方法将 FDE 降低了 12%。
+major|现有最好方法的准确率达到 92.3%。
+major|该模型将推理时延压缩到 9.2 ms。
+major|已有工作将参数量降低到 0.5 M。
+major|Trajectron++ 将 ADE 降低至 0.19。
+minor|本方法首次实现了毫秒级预测。
+major|相比 Social-GAN，该方法的误差降低 30%。
+major|该方法在 SDD 上的 FDE 为 15.2 像素。
