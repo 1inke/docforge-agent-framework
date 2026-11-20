@@ -298,21 +298,8 @@ def run_claim_rule_checks(
             rationale=msg,
         )
 
-    # 1. Check that any numeric values inside Agent-supplied `evidence.metrics_data` actually appear in `evidence.quote_excerpt` (T-R2-CLM-03)
+    # 1. Check for overclaim / exaggeration markers not present in `evidence.quote_excerpt`
     excerpt_clean = evidence.quote_excerpt.replace("\\text{", "").replace("}", "").replace("$", "")
-    if evidence.metrics_data:
-        metrics_json = json.dumps(evidence.metrics_data, ensure_ascii=False)
-        metric_numbers = RAW_NUMBER_PATTERN.findall(metrics_json)
-        ungrounded_metrics = [
-            num for num in metric_numbers if num not in excerpt_clean and num not in evidence.quote_excerpt
-        ]
-        if ungrounded_metrics:
-            conflicts.append(
-                f"Ungrounded metrics_data: Agent-supplied metrics_data contains numbers {ungrounded_metrics} "
-                f"that do not appear in the verified quote_excerpt ('{evidence.quote_excerpt[:100]}')."
-            )
-
-    # 2. Check for overclaim / exaggeration markers not present in `evidence.quote_excerpt` (T-EVD-01)
     exaggerations = [
         m for m in OVERCLAIM_MARKERS if m in binding.claim_text and m not in evidence.quote_excerpt
     ]
@@ -322,22 +309,25 @@ def run_claim_rule_checks(
             f"not supported by the bound excerpt."
         )
 
-    # 3. Check quantitative numbers with units in `claim_text` strictly against `evidence.quote_excerpt` (T-EVD-02 & T-R2-CLM-03)
-    claim_clean = binding.claim_text.replace("\\text{", "").replace("}", "").replace("$", "")
-    claim_quantities = QUANTITATIVE_NUMBER_PATTERN.findall(claim_clean)
-    mismatched_quantities: list[str] = []
-    for num_val, unit_val in claim_quantities:
-        if num_val not in excerpt_clean and num_val not in evidence.quote_excerpt:
-            mismatched_quantities.append(f"{num_val} {unit_val}")
+    # 2. R-B: Every numeric token in `claim_text` must appear with strict digit/dot boundaries in `quote_excerpt`
+    from daf.core.pandoc_ast import extract_numbers_strict, number_present_with_boundary
 
-    if mismatched_quantities:
+    claim_clean = binding.claim_text.replace("\\text{", "").replace("}", "").replace("$", "")
+    claim_numbers = extract_numbers_strict(claim_clean)
+    mismatched_numbers = [
+        num_val
+        for num_val in claim_numbers
+        if not number_present_with_boundary(num_val, excerpt_clean)
+        and not number_present_with_boundary(num_val, evidence.quote_excerpt)
+    ]
+    if mismatched_numbers:
         conflicts.append(
-            f"Quantitative conflict detected: claim_text asserts values {mismatched_quantities} "
-            f"which do not match the bound evidence quote_excerpt ('{evidence.quote_excerpt[:100]}')."
+            f"Quantitative conflict detected: claim_text asserts numbers {mismatched_numbers} "
+            f"which do not match the bound evidence quote_excerpt with numeric boundaries ('{evidence.quote_excerpt[:100]}')."
         )
 
-    # 4. Check directional / polarity reversal on quantitative claims (T-R2-CLM-03)
-    if claim_quantities:
+    # 3. Check directional / polarity reversal on quantitative claims
+    if claim_numbers:
         ev_has_dec = any(m in evidence.quote_excerpt for m in DECREASE_POLARITY_MARKERS)
         ev_has_inc = any(m in evidence.quote_excerpt for m in INCREASE_POLARITY_MARKERS)
         cl_has_dec = any(m in binding.claim_text for m in DECREASE_POLARITY_MARKERS)
@@ -788,7 +778,6 @@ class ContextManager:
                         "claim_summary",
                         "excerpt_match_status",
                         "source_reliability",
-                        "metrics_data",
                     ):
                         if getattr(existing, field_name) != getattr(ev_item, field_name):
                             changed_fields.append(field_name)
@@ -1036,7 +1025,6 @@ class ContextManager:
         slice_id = validate_safe_identifier(str(raw_item["slice_id"]), "slice_id")
         quote_excerpt = str(raw_item["quote_excerpt"]).strip()
         claim_summary = str(raw_item.get("claim_summary") or quote_excerpt[:160]).strip()
-        metrics_data = raw_item.get("metrics_data") or {}
         applicable_sections = list(raw_item.get("applicable_sections") or [])
 
         source_doc = state.source_registry.documents.get(source_id)
@@ -1045,11 +1033,12 @@ class ContextManager:
             raw_item.get("is_agent_generated_summary")
             or (source_doc and source_doc.is_agent_generated_summary)
         )
-        requested_reliability = raw_item.get("source_reliability") or (
-            "conditional" if is_agent_summary else "trusted"
-        )
-        if is_agent_summary and requested_reliability == "trusted":
-            requested_reliability = "conditional"
+        # L3 defaults to 'unassessed'; Agents may only downgrade reliability, never self-mark 'trusted'.
+        requested_reliability = raw_item.get("source_reliability") or "unassessed"
+        if requested_reliability == "trusted":
+            requested_reliability = "unassessed"
+        if is_agent_summary and requested_reliability in {"trusted", "unassessed"}:
+            requested_reliability = "agent_generated_untrusted"
 
         quote_hash = f"sha256:{compute_sha256_text(normalize_for_verification(quote_excerpt))}"
         source_sha = source_doc.file_sha256 if source_doc else ""
@@ -1071,7 +1060,6 @@ class ContextManager:
                 verification_note=(
                     f"Slice '{slice_id}' for source '{source_id}' does not exist in SourceRegistry."
                 ),
-                metrics_data=metrics_data,
                 applicable_sections=applicable_sections,
             )
 
@@ -1081,7 +1069,7 @@ class ContextManager:
             v_status: Literal["verified", "unverified_excerpt"] = "verified"
             note = (
                 f"L1 excerpt matched in {slice_id} ({source_slice.locator}). "
-                "Note: L1 match confirms substring presence only; L2a rule check and L2b semantic support review are evaluated per section binding."
+                "L1 confirms substring presence only; L2a rule check and L2b semantic support review run per section binding."
             )
         else:
             l1_status = "not_matched"
@@ -1105,7 +1093,6 @@ class ContextManager:
             quote_hash=quote_hash,
             is_agent_generated_summary=is_agent_summary,
             verification_note=note,
-            metrics_data=metrics_data,
             applicable_sections=applicable_sections,
         )
 
@@ -1553,7 +1540,6 @@ class ContextManager:
             "summary": sec.summary if sec else "",
             "claims": list(sec.claims) if sec else [],
             "source_bindings": [b.model_dump(mode="json") for b in sec.source_bindings] if sec else [],
-            "structured_blocks": [sb.model_dump(mode="json") for sb in sec.structured_blocks] if sec else [],
             "needs_revalidation": sec.needs_revalidation if sec else False,
             "stale_reason": sec.stale_reason if sec else "",
         }
@@ -1654,7 +1640,6 @@ class ContextManager:
                         "excerpt_match_status": ev.excerpt_match_status,
                         "source_reliability": ev.source_reliability,
                         "source_file_sha256": ev.source_file_sha256,
-                        "metrics_data": ev.metrics_data,
                     }
                 )
                 evidence_map[ev_id] = f"sha256:{ev_digest}"

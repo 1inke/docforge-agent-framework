@@ -76,10 +76,10 @@ class DAFEngine:
 
     # 2. get_document_profile
     def get_document_profile(self, profile_id: str) -> dict[str, Any]:
-        prof = get_document_profile(profile_id)
+        prof = get_document_profile(profile_id, workspace_root=self.workspace_root)
         return prof.model_dump(mode="json")
 
-    # 3. create_project (R2-P1-04 create-only & R2-P0-01 policy protection)
+    # 3. create_project (create-only; profiles are user-owned YAML files under <workspace>/profiles/)
     def create_project(
         self,
         project_id: str,
@@ -90,31 +90,9 @@ class DAFEngine:
         target_audience: str = "academic_reviewers",
         language: str = "zh-CN",
         global_constraints: list[str] | None = None,
-        profile_overrides: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         validate_safe_identifier(project_id, "project_id")
-        base_profile = get_document_profile(profile_id)
-        if profile_overrides:
-            if "approval_policy" in profile_overrides:
-                requested_policy = list(profile_overrides["approval_policy"] or [])
-                if "outline" not in requested_policy or "final_draft" not in requested_policy:
-                    raise UntrustedApprovalChannelError(
-                        "Security violation: cannot remove mandatory 'outline' or 'final_draft' human approval gates via profile_overrides.",
-                        details={"requested_approval_policy": requested_policy},
-                    )
-            merged_dict = base_profile.model_dump(mode="json")
-            for k, v in profile_overrides.items():
-                if k in {"require_outline_approval", "require_final_approval"}:
-                    continue
-                if k == "block_release_on_major_issues" and v is False:
-                    continue
-                if isinstance(v, dict) and isinstance(merged_dict.get(k), dict):
-                    merged_dict[k].update(v)
-                else:
-                    merged_dict[k] = v
-            profile = DocumentProfileContract.model_validate(merged_dict)
-        else:
-            profile = base_profile
+        profile = get_document_profile(profile_id, workspace_root=self.workspace_root)
 
         brief = ProjectBrief(
             project_id=project_id,
@@ -220,46 +198,70 @@ class DAFEngine:
 
         return self.store.transact_project(project_id, "set_source_policy_by_user", _mutator)
 
-    def update_profile_settings(
+    def apply_profile_by_user(
         self,
         project_id: str,
-        profile_overrides: dict[str, Any],
+        profile_id: str,
     ) -> dict[str, Any]:
-        """Update project DocumentProfileContract settings atomically (forbidding removal of mandatory approval gates)."""
-        if "approval_policy" in profile_overrides:
-            requested_policy = list(profile_overrides["approval_policy"] or [])
-            if "outline" not in requested_policy or "final_draft" not in requested_policy:
-                raise UntrustedApprovalChannelError(
-                    "Security violation: cannot disable mandatory 'outline' or 'final_draft' human approval gates.",
-                    details={"requested_approval_policy": requested_policy},
-                )
+        """Apply a user-authored YAML profile from <workspace>/profiles/ to a project (CLI/UI only).
+
+        Invalidates both outline and final_draft approvals if the profile changes.
+        """
+        new_profile = get_document_profile(profile_id, workspace_root=self.workspace_root)
 
         def _mutator(
             state: ProjectWorkspaceState, _conn: sqlite3.Connection
         ) -> tuple[dict[str, Any], str, dict[str, Any]]:
-            merged = state.profile.model_dump(mode="json")
-            for k, v in profile_overrides.items():
-                if k in {"require_outline_approval", "require_final_approval"}:
-                    continue
-                if k == "block_release_on_major_issues" and v is False:
-                    continue
-                if isinstance(v, dict) and isinstance(merged.get(k), dict):
-                    merged[k].update(v)
-                else:
-                    merged[k] = v
-            state.profile = DocumentProfileContract.model_validate(merged)
-            final_app = state.approvals.get("final_draft")
-            if final_app and final_app.status == "approved":
-                final_app.status = "invalidated_by_edit"
-                final_app.invalidation_reason = "DocumentProfileContract settings were modified."
+            state.profile = new_profile
+            state.brief.profile_id = new_profile.profile_id
+            invalidated: list[str] = []
+            for gk in ("outline", "final_draft"):
+                app = state.approvals.get(gk)
+                if app and app.status == "approved":
+                    app.status = "invalidated_by_change"
+                    app.invalidation_reason = f"Profile '{profile_id}' applied by local user."
+                    invalidated.append(gk)
+            for req in state.approval_requests.values():
+                if req.status == "pending" and req.artifact_type in {"outline", "final_draft"}:
+                    req.status = "stale"
             res = {
                 "project_id": project_id,
-                "state_version": state.state_version + 1,
-                "profile": state.profile.model_dump(mode="json"),
+                "profile_id": new_profile.profile_id,
+                "invalidated_approvals": invalidated,
+                "profile": new_profile.model_dump(mode="json"),
             }
-            return res, "Updated project profile settings.", profile_overrides
+            return res, f"Applied profile '{profile_id}' by local user.", {"profile_id": profile_id}
 
-        return self.store.transact_project(project_id, "update_profile_settings", _mutator)
+        return self.store.transact_project(project_id, "apply_profile_by_user", _mutator)
+
+    def set_evidence_reliability_by_user(
+        self,
+        project_id: str,
+        evidence_id: str,
+        reliability: Literal["trusted", "conditional", "unassessed", "rejected"],
+        updated_by: str = "local_user",
+    ) -> dict[str, Any]:
+        """Local user-only L3 reliability grading (only users may mark evidence 'trusted')."""
+
+        def _mutator(
+            state: ProjectWorkspaceState, _conn: sqlite3.Connection
+        ) -> tuple[dict[str, Any], str, dict[str, Any]]:
+            ev = state.evidence_ledger.items.get(evidence_id)
+            if ev is None:
+                raise ContractValidationError(f"Unknown evidence_id '{evidence_id}'.")
+            ev.source_reliability = reliability
+            ev.evidence_revision += 1
+            ev.updated_at = datetime.now(UTC).isoformat()
+            ev.updated_reason = f"L3 reliability set to '{reliability}' by {updated_by}"
+            res = {
+                "project_id": project_id,
+                "evidence_id": evidence_id,
+                "source_reliability": ev.source_reliability,
+                "evidence_revision": ev.evidence_revision,
+            }
+            return res, f"Set evidence '{evidence_id}' reliability to '{reliability}'.", res
+
+        return self.store.transact_project(project_id, "set_evidence_reliability_by_user", _mutator)
 
     # 4. ingest_sources
     def ingest_sources(
@@ -606,9 +608,8 @@ class DAFEngine:
         claim_evaluations: list[dict[str, Any]] | None = None,
         checklist_results: list[dict[str, Any]] | None = None,
         checklist_hash: str | None = None,
-        require_structured_checklist: bool = False,
-        auto_accept: bool = False,
     ) -> dict[str, Any]:
+        """Submit a structured semantic review report; valid approving reports are accepted immediately."""
         effective_reviewer = reviewed_by or reviewer_agent
 
         def _mutator(
@@ -625,18 +626,9 @@ class DAFEngine:
                 claim_evaluations=claim_evaluations,
                 checklist_results=checklist_results,
                 checklist_hash=checklist_hash,
-                require_structured_checklist=require_structured_checklist,
+                require_structured_checklist=True,
                 recommendation=recommendation,
             )
-            if auto_accept and recommendation == "approve":
-                acc = ReviewManager.accept_semantic_review(
-                    state=state,
-                    task_id=task_id,
-                    require_structured_checklist=require_structured_checklist,
-                )
-                res["acceptance"] = acc
-                res["status"] = acc["status"]
-                res["completed_at"] = acc["completed_at"]
             summary = f"Submitted semantic review for task '{task_id}' (rev={section_revision}, status={res['status']})."
             return res, summary, res
 
@@ -650,43 +642,31 @@ class DAFEngine:
                 )
             raise
 
-    # 9e. accept_semantic_review (R2-P0-02, R2-P1-06 & R3-01)
-    def accept_semantic_review(
-        self,
-        project_id: str,
-        task_id: str,
-        policy_version: str = "v1",
-        require_structured_checklist: bool = False,
-    ) -> dict[str, Any]:
-        def _mutator(
-            state: ProjectWorkspaceState, _conn: sqlite3.Connection
-        ) -> tuple[dict[str, Any], str, dict[str, Any]]:
-            res = ReviewManager.accept_semantic_review(
-                state=state,
-                task_id=task_id,
-                policy_version=policy_version,
-                require_structured_checklist=require_structured_checklist,
-            )
-            summary = f"Accepted semantic review task '{task_id}' for section '{res['section_id']}' r{res['section_revision']}."
-            return res, summary, res
-
-        try:
-            return self.store.transact_project(project_id, "accept_semantic_review", _mutator)
-        except ContractValidationError as exc:
-            if exc.code == "CLAIM_SUPPORT_CONFLICT":
-                self.store.record_audit_event(
-                    project_id, "semantic_review_conflict", "Rejected semantic override of deterministic claim checks.",
-                    {"task_id": task_id, "reason_code": exc.code},
-                )
-            raise
-
     # 10. get_revision_tasks
     def get_revision_tasks(self, project_id: str) -> dict[str, Any]:
         state = self.store.load_state(project_id)
         return ReviewManager.get_revision_tasks(state)
 
-    # 11. submit_feedback
-    def submit_feedback(
+    # 11. record_agent_note (Agent-callable: source='agent_note' only; cannot mutate user constraints)
+    def record_agent_note(
+        self,
+        project_id: str,
+        note_text: str,
+        target_section_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        def _mutator(
+            state: ProjectWorkspaceState, _conn: sqlite3.Connection
+        ) -> tuple[dict[str, Any], str, dict[str, Any]]:
+            res = WorkflowEngine.record_agent_note(
+                state=state,
+                note_text=note_text,
+                target_section_ids=target_section_ids,
+            )
+            return res, f"Recorded agent note '{res['decision_id']}'.", res
+
+        return self.store.transact_project(project_id, "record_agent_note", _mutator)
+
+    def add_user_decision_by_user(
         self,
         project_id: str,
         feedback_text: str,
@@ -696,10 +676,12 @@ class DAFEngine:
         acknowledge_template_conflicts: list[str] | None = None,
         invalidate_target_approvals: bool = True,
     ) -> dict[str, Any]:
+        """Local user-only decision & constraint recorder (CLI/UI only; never exposed to Agents)."""
+
         def _mutator(
             state: ProjectWorkspaceState, _conn: sqlite3.Connection
         ) -> tuple[dict[str, Any], str, dict[str, Any]]:
-            res = WorkflowEngine.submit_feedback(
+            res = WorkflowEngine.add_user_decision(
                 state=state,
                 feedback_text=feedback_text,
                 target_section_ids=target_section_ids,
@@ -708,10 +690,123 @@ class DAFEngine:
                 acknowledge_template_conflicts=acknowledge_template_conflicts,
                 invalidate_target_approvals=invalidate_target_approvals,
             )
-            summary = f"Recorded user feedback '{res['decision_id']}'."
-            return res, summary, res
+            return res, f"Recorded user decision '{res['decision_id']}'.", res
 
-        return self.store.transact_project(project_id, "submit_feedback", _mutator)
+        return self.store.transact_project(project_id, "add_user_decision_by_user", _mutator)
+
+    def adopt_agent_note_by_user(
+        self,
+        project_id: str,
+        decision_id: str,
+    ) -> dict[str, Any]:
+        """Promote an agent_note to an active user constraint (CLI/UI only)."""
+
+        def _mutator(
+            state: ProjectWorkspaceState, _conn: sqlite3.Connection
+        ) -> tuple[dict[str, Any], str, dict[str, Any]]:
+            res = WorkflowEngine.adopt_agent_note(state=state, decision_id=decision_id)
+            return res, f"Adopted agent note '{decision_id}' as user constraint.", res
+
+        return self.store.transact_project(project_id, "adopt_agent_note_by_user", _mutator)
+
+    def list_approvals(self, project_id: str) -> dict[str, Any]:
+        """Read-only list of approval requests and recorded approvals for local UI/CLI."""
+        state = self.store.load_state(project_id)
+        return {
+            "project_id": project_id,
+            "requests": [r.model_dump(mode="json") for r in state.approval_requests.values()],
+            "approvals": {k: v.model_dump(mode="json") for k, v in state.approvals.items()},
+        }
+
+    def show_approval_detail(self, project_id: str, approval_request_id: str) -> dict[str, Any]:
+        """Build a rich read-only inspection bundle (outline tree, section diffs, open issues, reviews) for local UI/CLI."""
+        import difflib
+
+        state = self.store.load_state(project_id)
+        req = state.approval_requests.get(approval_request_id)
+        if req is None:
+            raise ContractValidationError(f"Unknown approval_request_id '{approval_request_id}'.")
+
+        detail: dict[str, Any] = {
+            "project_id": project_id,
+            "title": state.brief.title,
+            "profile_id": state.profile.profile_id,
+            "request": req.model_dump(mode="json"),
+            "open_issues": [
+                iss.model_dump(mode="json")
+                for iss in state.review_ledger.issues
+                if iss.status == "open"
+            ],
+            "agent_notes": [
+                e.model_dump(mode="json")
+                for e in state.decision_log.entries
+                if e.source == "agent_note" and not e.adopted_as_constraint
+            ],
+        }
+        if req.artifact_type == "outline":
+            rules_by_id = {
+                r.section_id: r
+                for r in (
+                    state.profile.structure_profile.required_sections
+                    + state.profile.structure_profile.optional_sections
+                )
+            }
+            nodes_view = []
+            for n in state.outline_graph.nodes:
+                min_w, max_w, origin = resolve_section_word_budget(rules_by_id.get(n.section_id), n)
+                ev_quotes = [
+                    {
+                        "evidence_id": eid,
+                        "quote_excerpt": state.evidence_ledger.items[eid].quote_excerpt,
+                        "source_reliability": state.evidence_ledger.items[eid].source_reliability,
+                    }
+                    for eid in n.assigned_evidence_ids
+                    if eid in state.evidence_ledger.items
+                ]
+                nodes_view.append(
+                    {
+                        "section_id": n.section_id,
+                        "title": n.title,
+                        "depends_on": n.depends_on,
+                        "word_budget": {"min_words": min_w, "max_words": max_w, "origin": origin},
+                        "assigned_evidence": ev_quotes,
+                    }
+                )
+            detail["outline"] = {
+                "global_thesis": state.outline_graph.global_thesis,
+                "outline_revision": state.outline_graph.outline_revision,
+                "nodes": nodes_view,
+            }
+        else:
+            section_diffs: list[dict[str, Any]] = []
+            for sid, sec in sorted(state.section_versions.sections.items()):
+                prev_md = ""
+                if len(sec.history) >= 2:
+                    prev_md = sec.history[-2].content_markdown
+                diff_text = "".join(
+                    difflib.unified_diff(
+                        prev_md.splitlines(keepends=True),
+                        sec.content_markdown.splitlines(keepends=True),
+                        fromfile=f"{sid}@prev",
+                        tofile=f"{sid}@r{sec.revision}",
+                        n=2,
+                    )
+                )
+                rep = state.review_ledger.semantic_reports.get(sid)
+                section_diffs.append(
+                    {
+                        "section_id": sid,
+                        "title": sec.title,
+                        "revision": sec.revision,
+                        "content_hash": sec.content_hash,
+                        "diff": diff_text,
+                        "review_summary": rep.review_summary if rep else "",
+                        "review_status": rep.status if rep else "none",
+                    }
+                )
+            detail["sections"] = section_diffs
+            detail["last_rendered_docx_path"] = state.last_rendered_docx_path
+        return detail
 
     # 12a. request_approval (R2-P0-01 non-privileged Agent approval request — NEVER returns confirmation_token)
     def request_approval(
@@ -1385,7 +1480,6 @@ class DAFEngine:
             "get_task_guidance": self.get_task_guidance,
             "get_source_policy": self.get_source_policy,
             "create_project": self.create_project,
-            "update_profile_settings": self.update_profile_settings,
             "ingest_sources": self.ingest_sources,
             "list_source_blocks": self.list_source_blocks,
             "get_source_block": self.get_source_block,
@@ -1400,9 +1494,8 @@ class DAFEngine:
             "list_semantic_review_tasks": self.list_semantic_review_tasks,
             "claim_semantic_review_task": self.claim_semantic_review_task,
             "submit_semantic_review": self.submit_semantic_review,
-            "accept_semantic_review": self.accept_semantic_review,
             "get_revision_tasks": self.get_revision_tasks,
-            "submit_feedback": self.submit_feedback,
+            "record_agent_note": self.record_agent_note,
             "request_approval": self.request_approval,
             "get_approval_status": self.get_approval_status,
             "get_project_status": self.get_project_status,

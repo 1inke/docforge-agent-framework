@@ -64,7 +64,6 @@ def compute_final_draft_aggregate_hash(state: ProjectWorkspaceState) -> str:
                 "revision": sec.revision,
                 "title": sec.title,
                 "content_hash": sec.content_hash,
-                "structured_blocks": [b.model_dump(mode="json") for b in sec.structured_blocks],
             }
     agg_payload = {
         "outline_hash": state.outline_graph.outline_hash,
@@ -532,7 +531,6 @@ class WorkflowEngine:
         submission: SectionSubmissionContract,
     ) -> dict[str, Any]:
         section_id = validate_safe_identifier(submission.section_id, "section_id")
-        SourcePolicyEvaluator.assert_evidence(state, (b.evidence_id for b in submission.source_bindings if b.evidence_id))
         if submission.project_id != state.brief.project_id:
             raise ContractValidationError(
                 f"Submission project_id '{submission.project_id}' does not match workspace project_id '{state.brief.project_id}'."
@@ -617,82 +615,148 @@ class WorkflowEngine:
 
         new_rev = current_rev + 1
 
-        # 6. Validate L1 excerpt match and run L2a rule checks (R2-P1-06: never auto-promote to supported_reviewed!)
+        # 6. Parse content_markdown via Pandoc JSON AST and derive bindings + L2a checks (P0-1)
+        from daf.core.contracts import ReviewIssue
+        from daf.core.pandoc_ast import (
+            analyze_markdown_with_pandoc,
+            hypothesis_has_false_experiment_marker,
+            sentence_needs_citation,
+        )
+
+        parsed_sentences, _ast_stats, _ast = analyze_markdown_with_pandoc(submission.content_markdown)
         bound_evidence_ids: list[str] = []
         enriched_bindings: list[SourceBinding] = []
+        derived_claims: list[str] = []
         l2_warnings: list[dict[str, str]] = []
+        uncited_issues: list[dict[str, Any]] = []
 
-        for b_idx, binding in enumerate(submission.source_bindings, start=1):
-            b_copy = binding.model_copy(deep=True)
-            if not b_copy.binding_id:
-                b_copy.binding_id = f"B_{section_id}_r{new_rev}_{b_idx:02d}"
-            b_copy.section_id = section_id
-            b_copy.section_revision = new_rev
+        # Clear previous open UNCITED_FACTUAL_CLAIM issues for this section before re-evaluating
+        for old_iss in state.review_ledger.issues:
+            if (
+                old_iss.target_section_id == section_id
+                and old_iss.category == "UNCITED_FACTUAL_CLAIM"
+                and old_iss.status == "open"
+            ):
+                old_iss.status = "resolved"
+                old_iss.resolved_in_revision = new_rev
 
-            # Prevent Agent from self-certifying `supported_reviewed` or `supported` on section submission (R2-P1-06 §6.3(4))
-            caller_flagged_negative = b_copy.support_status in {"unsupported", "partially_supported"} or b_copy.semantic_support_status in {"unsupported", "partially_supported"}
-            negative_status = (
-                b_copy.semantic_support_status
-                if b_copy.semantic_support_status in {"unsupported", "partially_supported"}
-                else (b_copy.support_status if b_copy.support_status in {"unsupported", "partially_supported"} else None)
-            )
-            b_copy.semantic_support_status = "pending"
-            b_copy.support_status = "pending"
-            b_copy.reviewed_against_revision = None
-            b_copy.reviewed_against_section_hash = ""
-            b_copy.reviewed_against_evidence_fingerprint = ""
-            b_copy.reviewed_evidence_revision = None
+        for sent in parsed_sentences:
+            if not sent.citation_ids and not sent.is_hypothesis:
+                # R-A: uncited quantitative/comparative factual claim
+                if sentence_needs_citation(sent.text):
+                    issue_id = f"uncited_{section_id}_r{new_rev}_s{sent.index:03d}"
+                    issue_desc = (
+                        f"Uncited factual/quantitative sentence in section '{section_id}': "
+                        f"'{sent.text[:140]}'. Add inline citation [@ev_id] or mark as [@hypothesis]."
+                    )
+                    uncited_issues.append(
+                        {
+                            "issue_id": issue_id,
+                            "category": "UNCITED_FACTUAL_CLAIM",
+                            "severity": "major",
+                            "sentence_index": sent.index,
+                            "sentence_text": sent.text,
+                            "description": issue_desc,
+                        }
+                    )
+                    state.review_ledger.issues.append(
+                        ReviewIssue(
+                            issue_id=issue_id,
+                            target_section_id=section_id,
+                            severity="major",
+                            category="UNCITED_FACTUAL_CLAIM",
+                            description=issue_desc,
+                            suggested_fix="Add a verified inline citation [@ev_id] or mark the statement with [@hypothesis].",
+                            status="open",
+                        )
+                    )
+                continue
 
-            if b_copy.claim_type == "research_hypothesis" and not b_copy.evidence_id:
-                sup_status, sup_reason = evaluate_claim_binding_support(b_copy, None)
+            derived_claims.append(sent.text)
+
+            # R-D: hypothesis-only sentence
+            if sent.is_hypothesis and not sent.citation_ids:
+                bid = f"{section_id}_s{sent.index:03d}_{sent.sentence_hash[:8]}"
+                b_copy = SourceBinding(
+                    binding_id=bid,
+                    section_id=section_id,
+                    section_revision=new_rev,
+                    claim_text=sent.text,
+                    evidence_id="",
+                    claim_type="research_hypothesis",
+                )
+                false_markers = hypothesis_has_false_experiment_marker(sent.text)
+                if false_markers:
+                    b_copy.rule_check_status = "rule_failed"
+                    b_copy.support_status = "unsupported"
+                    b_copy.rationale = (
+                        f"Hypothesis sentence contains false experimental phrasing {false_markers}."
+                    )
+                    b_copy.support_rationale = b_copy.rationale
+                    l2_warnings.append(
+                        {
+                            "binding_id": bid,
+                            "rule_check_status": b_copy.rule_check_status,
+                            "support_status": b_copy.support_status,
+                            "rationale": b_copy.rationale,
+                        }
+                    )
+                else:
+                    sup_status, sup_reason = evaluate_claim_binding_support(b_copy, None)
+                    b_copy.support_rationale = sup_reason
+                    b_copy.rationale = sup_reason
+                enriched_bindings.append(b_copy)
+                continue
+
+            # Cited sentence: generate one SourceBinding per cited evidence_id
+            for ev_idx, ev_id in enumerate(sent.citation_ids):
+                ev = state.evidence_ledger.items.get(ev_id)
+                # R-C: nonexistent or L1-unmatched evidence rejects submission
+                if ev is None:
+                    raise ContractValidationError(
+                        f"Section '{section_id}' cites nonexistent evidence_id '{ev_id}'.",
+                        code="EVIDENCE_UNVERIFIED",
+                    )
+                if ev.excerpt_match_status != "matched":
+                    raise ContractValidationError(
+                        f"Section '{section_id}' cites unverified/stale evidence_id '{ev_id}' "
+                        f"(excerpt_match_status={ev.excerpt_match_status}). Unmatched evidence cannot be committed.",
+                        code="EVIDENCE_UNVERIFIED",
+                    )
+                SourcePolicyEvaluator.assert_source(state, ev.source_id, "cite")
+
+                suffix = "" if len(sent.citation_ids) == 1 else f"_{ev_idx:02d}"
+                bid = f"{section_id}_s{sent.index:03d}_{sent.sentence_hash[:8]}{suffix}"
+                b_copy = SourceBinding(
+                    binding_id=bid,
+                    section_id=section_id,
+                    section_revision=new_rev,
+                    claim_text=sent.text,
+                    evidence_id=ev_id,
+                    claim_type="research_hypothesis" if sent.is_hypothesis else "experimental_result",
+                    evidence_quote_hash=ev.quote_hash,
+                    semantic_support_status="pending",
+                    support_status="pending",
+                )
+                sup_status, sup_reason = evaluate_claim_binding_support(b_copy, ev)
                 b_copy.support_rationale = sup_reason
                 b_copy.rationale = sup_reason
-                if b_copy.rule_check_status == "rule_failed":
+                if b_copy.rule_check_status == "rule_failed" or b_copy.support_status in {
+                    "unsupported",
+                    "partially_supported",
+                }:
                     l2_warnings.append(
                         {
                             "binding_id": b_copy.binding_id,
+                            "evidence_id": b_copy.evidence_id,
                             "rule_check_status": b_copy.rule_check_status,
                             "support_status": b_copy.support_status,
                             "rationale": sup_reason,
                         }
                     )
+                if ev_id not in bound_evidence_ids:
+                    bound_evidence_ids.append(ev_id)
                 enriched_bindings.append(b_copy)
-                continue
-
-            ev = state.evidence_ledger.items.get(b_copy.evidence_id)
-            if ev is None:
-                raise ContractValidationError(
-                    f"Section '{section_id}' binds to nonexistent evidence_id '{b_copy.evidence_id}'.",
-                    code="EVIDENCE_UNVERIFIED",
-                )
-            if ev.excerpt_match_status != "matched":
-                raise ContractValidationError(
-                    f"Section '{section_id}' binds to unverified/stale evidence_id '{b_copy.evidence_id}' "
-                    f"(excerpt_match_status={ev.excerpt_match_status}). Unmatched evidence cannot be committed.",
-                    code="EVIDENCE_UNVERIFIED",
-                )
-
-            b_copy.evidence_quote_hash = ev.quote_hash
-            sup_status, sup_reason = evaluate_claim_binding_support(b_copy, ev)
-            if caller_flagged_negative and negative_status and b_copy.rule_check_status != "rule_failed":
-                b_copy.semantic_support_status = negative_status  # type: ignore[assignment]
-                b_copy.support_status = negative_status  # type: ignore[assignment]
-            b_copy.support_rationale = sup_reason
-            b_copy.rationale = sup_reason
-            if b_copy.rule_check_status == "rule_failed" or b_copy.support_status in {"unsupported", "partially_supported"}:
-                l2_warnings.append(
-                    {
-                        "binding_id": b_copy.binding_id,
-                        "evidence_id": b_copy.evidence_id,
-                        "rule_check_status": b_copy.rule_check_status,
-                        "support_status": b_copy.support_status,
-                        "rationale": sup_reason,
-                    }
-                )
-
-            if b_copy.evidence_id not in bound_evidence_ids:
-                bound_evidence_ids.append(b_copy.evidence_id)
-            enriched_bindings.append(b_copy)
 
         old_markdown = existing_sec.content_markdown if existing_sec else ""
         diff_lines = list(
@@ -733,12 +797,12 @@ class WorkflowEngine:
             context_fingerprint=live_ctx_fp,
             draft_mode=submission.draft_mode,
             idempotency_key=submission.idempotency_key,
+            author_session=submission.author_session,
             content_hash=content_hash,
             content_markdown=submission.content_markdown,
             summary=submission.summary,
-            claims=list(submission.claims),
+            claims=derived_claims,
             source_bindings=enriched_bindings,
-            structured_blocks=list(submission.structured_blocks),
             unresolved_questions=list(submission.unresolved_questions),
             diff_from_previous=diff_text,
             created_at=now_iso,
@@ -750,15 +814,16 @@ class WorkflowEngine:
 
         existing_sec.title = sec_title
         existing_sec.revision = new_rev
+        existing_sec.author_session = submission.author_session
         existing_sec.content_hash = content_hash
         existing_sec.context_revision_used = submission.context_revision
         existing_sec.context_fingerprint_used = live_ctx_fp
         existing_sec.is_preapproval_draft = submission.draft_mode == "draft_preapproval"
         existing_sec.content_markdown = submission.content_markdown
         existing_sec.summary = submission.summary
-        existing_sec.claims = list(submission.claims)
+        existing_sec.claims = derived_claims
         existing_sec.source_bindings = enriched_bindings
-        existing_sec.structured_blocks = list(submission.structured_blocks)
+        existing_sec.uncited_claim_issues = uncited_issues
         existing_sec.unresolved_questions = list(submission.unresolved_questions)
         existing_sec.needs_revalidation = False
         existing_sec.stale_reason = ""
@@ -849,7 +914,9 @@ class WorkflowEngine:
             "content_hash": content_hash,
             "word_count": count_effective_words(submission.content_markdown),
             "bound_evidence_ids": bound_evidence_ids,
+            "source_bindings": [b.model_dump(mode="json") for b in enriched_bindings],
             "l2_claim_support_warnings": l2_warnings,
+            "uncited_claim_issues": uncited_issues,
             "resolved_issue_ids": resolved_ids,
             "downstream_sections_marked_for_revalidation": downstream_marked,
             "invalidated_approvals": invalidated_approvals,
@@ -1087,7 +1154,39 @@ class WorkflowEngine:
         }
 
     @classmethod
-    def submit_feedback(
+    def record_agent_note(
+        cls,
+        state: ProjectWorkspaceState,
+        note_text: str,
+        target_section_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Agent-callable note recorder: writes source='agent_note' only; cannot touch user constraints or conflict acknowledgments."""
+        if not note_text or not note_text.strip():
+            raise ContractValidationError("note_text must not be empty.")
+        targets = list(target_section_ids or [])
+        for tid in targets:
+            validate_safe_identifier(tid, "target_section_id")
+
+        decision_id = f"note_{len(state.decision_log.entries) + 1:03d}"
+        decision = DecisionRecord(
+            decision_id=decision_id,
+            source="agent_note",
+            summary=note_text.strip(),
+            scope=targets if targets else ["global"],
+            forbidden_modification_scopes=[],
+            adopted_as_constraint=False,
+        )
+        state.decision_log.entries.append(decision)
+        return {
+            "decision_id": decision_id,
+            "source": "agent_note",
+            "summary": decision.summary,
+            "scope": decision.scope,
+            "adopted_as_constraint": False,
+        }
+
+    @classmethod
+    def add_user_decision(
         cls,
         state: ProjectWorkspaceState,
         feedback_text: str,
@@ -1097,6 +1196,7 @@ class WorkflowEngine:
         acknowledge_template_conflicts: list[str] | None = None,
         invalidate_target_approvals: bool = True,
     ) -> dict[str, Any]:
+        """Local user-only decision recorder (CLI/UI): writes source='user' and may update constraints/scopes/template conflicts."""
         if not feedback_text or not feedback_text.strip():
             raise ContractValidationError("feedback_text must not be empty.")
 
@@ -1107,23 +1207,24 @@ class WorkflowEngine:
         decision_id = f"dec_{len(state.decision_log.entries) + 1:03d}"
         decision = DecisionRecord(
             decision_id=decision_id,
-            source="user_feedback",
+            source="user",
             summary=feedback_text.strip(),
             scope=targets if targets else ["global"],
             forbidden_modification_scopes=list(add_forbidden_scopes or []),
+            adopted_as_constraint=True,
         )
         state.decision_log.entries.append(decision)
 
         for constraint in add_user_constraints or []:
-            if constraint not in state.decision_log.active_user_constraints:
+            if constraint and constraint not in state.decision_log.active_user_constraints:
                 state.decision_log.active_user_constraints.append(constraint)
 
         for scope in add_forbidden_scopes or []:
-            if scope not in state.decision_log.forbidden_modification_scopes:
+            if scope and scope not in state.decision_log.forbidden_modification_scopes:
                 state.decision_log.forbidden_modification_scopes.append(scope)
 
         for ack in acknowledge_template_conflicts or []:
-            if ack not in state.decision_log.acknowledged_template_conflicts:
+            if ack and ack not in state.decision_log.acknowledged_template_conflicts:
                 state.decision_log.acknowledged_template_conflicts.append(ack)
 
         created_issues: list[str] = []
@@ -1148,14 +1249,34 @@ class WorkflowEngine:
                         app = state.approvals.get(gk)
                         if app and app.status == "approved":
                             app.status = "invalidated_by_edit"
-                            app.invalidation_reason = f"Invalidated by user feedback ({decision_id})."
+                            app.invalidation_reason = f"Invalidated by user decision ({decision_id})."
                             invalidated_approvals.append(gk)
 
         return {
             "decision_id": decision_id,
+            "source": "user",
             "active_user_constraints": list(state.decision_log.active_user_constraints),
             "forbidden_modification_scopes": list(state.decision_log.forbidden_modification_scopes),
             "acknowledged_template_conflicts": list(state.decision_log.acknowledged_template_conflicts),
             "created_issue_ids": created_issues,
             "invalidated_approvals": invalidated_approvals,
+        }
+
+    @classmethod
+    def adopt_agent_note(
+        cls,
+        state: ProjectWorkspaceState,
+        decision_id: str,
+    ) -> dict[str, Any]:
+        """Promote an agent_note into active_user_constraints (local UI/CLI only)."""
+        entry = next((e for e in state.decision_log.entries if e.decision_id == decision_id), None)
+        if entry is None:
+            raise ContractValidationError(f"Unknown note/decision '{decision_id}'.")
+        entry.adopted_as_constraint = True
+        if entry.summary not in state.decision_log.active_user_constraints:
+            state.decision_log.active_user_constraints.append(entry.summary)
+        return {
+            "decision_id": decision_id,
+            "adopted_as_constraint": True,
+            "active_user_constraints": list(state.decision_log.active_user_constraints),
         }

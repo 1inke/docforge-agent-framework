@@ -546,6 +546,25 @@ class ReviewManager:
                 f"SemanticReviewTask '{task_id}' cannot be claimed from status '{task.status}'.",
                 details={"task_id": task_id, "status": task.status},
             )
+        # P0-2C: Prevent the author session from claiming its own section review
+        sec_id = task.section_id or (task.target_section_ids[0] if task.target_section_ids else "")
+        sec_state = state.section_versions.sections.get(sec_id)
+        if (
+            sec_state is not None
+            and sec_state.author_session
+            and agent_session_id
+            and sec_state.author_session.strip() == agent_session_id.strip()
+        ):
+            raise ContractValidationError(
+                f"Reviewer '{agent_session_id}' cannot review section '{sec_id}' authored by the same session.",
+                code="REVIEWER_IS_AUTHOR",
+                details={
+                    "task_id": task_id,
+                    "section_id": sec_id,
+                    "author_session": sec_state.author_session,
+                    "reviewer_id": agent_session_id,
+                },
+            )
         now_iso = datetime.now(timezone.utc).isoformat()
         task.status = "claimed"
         task.claimed_by = agent_session_id
@@ -738,6 +757,41 @@ class ReviewManager:
                         task.rejection_reason,
                         details={"task_id": task_id, "check_id": r_item.check_id},
                     )
+                # P0-2C: Every checklist item must be anchored in actual section text
+                from daf.context_manager.manager import normalize_for_verification
+
+                norm_section_body = normalize_for_verification(sec_state.content_markdown)
+                if r_item.verdict == "not_applicable":
+                    if len(r_item.rationale.strip()) < 20:
+                        task.status = "rejected"
+                        task.rejection_reason = (
+                            f"Checklist item '{r_item.check_id}' marked 'not_applicable' requires a rationale of at least 20 characters."
+                        )
+                        raise ReviewChecklistIncompleteError(
+                            task.rejection_reason,
+                            details={"task_id": task_id, "check_id": r_item.check_id},
+                        )
+                else:
+                    if not r_item.quotes:
+                        task.status = "rejected"
+                        task.rejection_reason = (
+                            f"Checklist item '{r_item.check_id}' must include at least one quote from section '{sec_id}'."
+                        )
+                        raise ReviewChecklistIncompleteError(
+                            task.rejection_reason,
+                            details={"task_id": task_id, "check_id": r_item.check_id},
+                        )
+                    for q in r_item.quotes:
+                        norm_q = normalize_for_verification(q)
+                        if not norm_q or norm_q not in norm_section_body:
+                            task.status = "rejected"
+                            task.rejection_reason = (
+                                f"Checklist item '{r_item.check_id}' quote is not a substring of section '{sec_id}'."
+                            )
+                            raise ReviewChecklistIncompleteError(
+                                task.rejection_reason,
+                                details={"task_id": task_id, "check_id": r_item.check_id, "quote": q[:120]},
+                            )
                 if not r_item.question:
                     r_item.question = expected_check_map[r_item.check_id]
                 elif r_item.question != expected_check_map[r_item.check_id]:
@@ -842,6 +896,20 @@ class ReviewManager:
         task.status = "submitted"
         task.submitted_at = now_iso
         task.rejection_reason = ""
+
+        # P0-2C: Submit-is-accept for valid approving reports
+        has_failing_check = any(r.verdict in {"fail", "needs_revision"} for r in parsed_checklist_results)
+        has_major_finding = any(f.severity in {"critical", "major"} for f in validated_findings)
+        if report.recommendation == "approve" and not has_failing_check and not has_major_finding:
+            accepted_out = cls.accept_semantic_review(
+                state=state,
+                task_id=task_id,
+                policy_version="v1",
+                require_structured_checklist=True,
+            )
+            accepted_out["created_issue_ids"] = created_issue_ids
+            return accepted_out
+
         out = task.model_dump(mode="json")
         out["created_issue_ids"] = created_issue_ids
         return out

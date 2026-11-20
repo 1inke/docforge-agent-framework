@@ -195,59 +195,6 @@ def parse_section_to_ir(sec: SectionState) -> tuple[IRSection, int, int]:
             )
         )
 
-    # Append structured_blocks without duplicating equations or tables already in the Markdown
-    for sblk in sec.structured_blocks:
-        seq += 1
-        bid = sblk.block_id or f"ir_{sec.section_id}_sb_{seq:03d}"
-        if sblk.block_type == "equation" and sblk.latex:
-            clean_latex = sblk.latex.strip().removeprefix("$$").removesuffix("$$").strip()
-            norm_latex = re.sub(r"\s+", " ", clean_latex)
-            if norm_latex in seen_equation_latex:
-                continue
-            seen_equation_latex.add(norm_latex)
-            eq_count += 1
-            blocks.append(
-                IRBlock(
-                    block_id=bid,
-                    section_id=sec.section_id,
-                    block_type="equation",
-                    style_role="display_equation",
-                    latex=clean_latex,
-                    caption=sblk.caption,
-                    source_refs=ref_ids,
-                )
-            )
-        elif sblk.block_type == "table":
-            sig = "|".join(sblk.table_headers) + f":{len(sblk.table_rows)}"
-            if sig in seen_table_signatures:
-                continue
-            seen_table_signatures.add(sig)
-            tbl_count += 1
-            blocks.append(
-                IRBlock(
-                    block_id=bid,
-                    section_id=sec.section_id,
-                    block_type="table",
-                    style_role="data_table",
-                    table_headers=list(sblk.table_headers),
-                    table_rows=[list(r) for r in sblk.table_rows],
-                    caption=sblk.caption,
-                    source_refs=ref_ids,
-                )
-            )
-        elif sblk.block_type == "figure_placeholder":
-            blocks.append(
-                IRBlock(
-                    block_id=bid,
-                    section_id=sec.section_id,
-                    block_type="figure_ref",
-                    style_role="figure_caption",
-                    caption=sblk.caption or sblk.block_id,
-                    text=f"[图占位符: {sblk.caption or sblk.block_id}]",
-                    source_refs=ref_ids,
-                )
-            )
-
     ir_sec = IRSection(
         section_id=sec.section_id,
         title=sec.title,

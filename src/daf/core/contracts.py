@@ -164,6 +164,7 @@ class SourceDocumentRecord(StrictContractModel):
     ingested_at: str = Field(default_factory=utc_now_iso)
     slice_ids: list[str] = Field(default_factory=list)
     is_agent_generated_summary: bool = False
+    bibliography: dict[str, Any] | None = None
 
 
 class TemplateInspectionReport(StrictContractModel):
@@ -221,12 +222,12 @@ class EvidenceItem(StrictContractModel):
     excerpt_match_status: Literal["matched", "not_matched", "unmatched", "source_stale", "stale"] = "matched"
     verification_status: Literal["verified", "unverified_excerpt"] = "verified"
     source_reliability: Literal[
+        "unassessed",
         "trusted",
         "conditional",
-        "unassessed",
         "rejected",
         "agent_generated_untrusted",
-    ] = "trusted"
+    ] = "unassessed"
     source_file_sha256: str = ""
     quote_hash: str = ""
     evidence_revision: int = 1
@@ -235,7 +236,6 @@ class EvidenceItem(StrictContractModel):
     updated_reason: str = ""
     is_agent_generated_summary: bool = False
     verification_note: str = ""
-    metrics_data: dict[str, Any] = Field(default_factory=dict)
     applicable_sections: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -264,7 +264,6 @@ class EvidenceItem(StrictContractModel):
                 "claim_summary": self.claim_summary,
                 "excerpt_match_status": self.excerpt_match_status,
                 "source_reliability": self.source_reliability,
-                "metrics_data": self.metrics_data,
             }
         )
         self.evidence_fingerprint = f"sha256:{fp_digest}"
@@ -308,10 +307,11 @@ class TerminologyRegistry(StrictContractModel):
 class DecisionRecord(StrictContractModel):
     decision_id: str
     timestamp: str = Field(default_factory=utc_now_iso)
-    source: Literal["user_feedback", "approval_gate", "agent_proposal"]
+    source: Literal["user", "agent_note", "approval_gate", "agent_proposal", "user_feedback"]
     summary: str
     scope: list[str] = Field(default_factory=list)
     forbidden_modification_scopes: list[str] = Field(default_factory=list)
+    adopted_as_constraint: bool = False
 
 
 class DecisionLog(StrictContractModel):
@@ -456,6 +456,7 @@ class ReviewIssue(StrictContractModel):
         "word_budget",
         "forbidden_phrase",
         "evidence_binding",
+        "UNCITED_FACTUAL_CLAIM",
         "claim_support",
         "terminology_consistency",
         "cross_section_consistency",
@@ -481,6 +482,7 @@ class SemanticReviewFinding(StrictContractModel):
         "word_budget",
         "forbidden_phrase",
         "evidence_binding",
+        "UNCITED_FACTUAL_CLAIM",
         "claim_support",
         "terminology_consistency",
         "cross_section_consistency",
@@ -503,12 +505,13 @@ class ChecklistItemSpec(StrictContractModel):
 
 
 class ChecklistItemResult(StrictContractModel):
-    """Structured per-item checklist answer in a SemanticReviewReport (R3-01 §5.2)."""
+    """Structured per-item checklist answer in a SemanticReviewReport."""
 
     check_id: str
     question: str = ""
     verdict: Literal["pass", "fail", "needs_revision", "not_applicable"]
     rationale: str
+    quotes: list[str] = Field(default_factory=list)
     section_locations: list[str] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
 
@@ -659,7 +662,11 @@ class SectionContextContract(StrictContractModel):
 
 
 class SectionSubmissionContract(StrictContractModel):
-    """Optimistic-locked, context-verified, idempotent section submission payload (§6.3 & DAF-P0-01/P0-02)."""
+    """Optimistic-locked, context-verified, idempotent section submission payload.
+
+    Claims and evidence bindings are parsed directly from inline Pandoc citations
+    in ``content_markdown`` rather than trusting an external self-reported list.
+    """
 
     project_id: str
     section_id: str
@@ -670,9 +677,7 @@ class SectionSubmissionContract(StrictContractModel):
     idempotency_key: str
     content_markdown: str
     summary: str
-    claims: list[str] = Field(default_factory=list)
-    source_bindings: list[SourceBinding] = Field(default_factory=list)
-    structured_blocks: list[StructuredBlock] = Field(default_factory=list)
+    author_session: str = ""
     resolved_issue_ids: list[str] = Field(default_factory=list)
     unresolved_questions: list[str] = Field(default_factory=list)
 
@@ -684,12 +689,12 @@ class SectionRevisionRecord(StrictContractModel):
     context_fingerprint: str = ""
     draft_mode: Literal["formal", "draft_preapproval"] = "formal"
     idempotency_key: str
+    author_session: str = ""
     content_hash: str
     content_markdown: str
     summary: str
     claims: list[str] = Field(default_factory=list)
     source_bindings: list[SourceBinding] = Field(default_factory=list)
-    structured_blocks: list[StructuredBlock] = Field(default_factory=list)
     unresolved_questions: list[str] = Field(default_factory=list)
     diff_from_previous: str = ""
     created_at: str = Field(default_factory=utc_now_iso)
@@ -699,6 +704,7 @@ class SectionState(StrictContractModel):
     section_id: str
     title: str
     revision: int = 0
+    author_session: str = ""
     content_hash: str = ""
     context_revision_used: str = ""
     context_fingerprint_used: str = ""
@@ -707,7 +713,7 @@ class SectionState(StrictContractModel):
     summary: str = ""
     claims: list[str] = Field(default_factory=list)
     source_bindings: list[SourceBinding] = Field(default_factory=list)
-    structured_blocks: list[StructuredBlock] = Field(default_factory=list)
+    uncited_claim_issues: list[dict[str, Any]] = Field(default_factory=list)
     unresolved_questions: list[str] = Field(default_factory=list)
     needs_revalidation: bool = False
     stale_reason: str = ""
