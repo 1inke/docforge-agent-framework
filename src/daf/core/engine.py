@@ -411,13 +411,21 @@ class DAFEngine:
         )
 
         def _mutator(
-            state: ProjectWorkspaceState, _conn: sqlite3.Connection
+            state: ProjectWorkspaceState, conn: sqlite3.Connection
         ) -> tuple[dict[str, Any], str, dict[str, Any]]:
             ingested_docs: list[dict[str, Any]] = []
             invalidated_evidence: list[str] = []
+            now_iso = datetime.now(UTC).isoformat()
 
             for doc_rec, slices in parsed_sources:
                 inv_ids = ContextManager.apply_source_ingestion_to_state(state, doc_rec, slices)
+                self.store.write_source_slices_in_tx(
+                    conn,
+                    project_id,
+                    doc_rec.source_id,
+                    slices,
+                    now_iso=now_iso,
+                )
                 invalidated_evidence.extend(inv_ids)
                 ingested_docs.append(
                     {
@@ -425,7 +433,7 @@ class DAFEngine:
                         "file_name": doc_rec.file_name,
                         "file_type": doc_rec.file_type,
                         "file_sha256": doc_rec.file_sha256,
-                        "slice_ids": doc_rec.slice_ids,
+                        "slice_count": doc_rec.slice_count,
                         "is_agent_generated_summary": doc_rec.is_agent_generated_summary,
                     }
                 )
@@ -440,11 +448,12 @@ class DAFEngine:
             if state.stage == "initialized":
                 state.stage = "sources_ingested"
 
+            total_slices = sum(d.slice_count for d in state.source_registry.documents.values())
             res = {
                 "project_id": project_id,
                 "stage": state.stage,
                 "ingested_sources": ingested_docs,
-                "total_slices": len(state.source_registry.slices),
+                "total_slices": total_slices,
                 "invalidated_evidence_ids": invalidated_evidence,
                 "template_inspection": tpl_report_dict,
                 "profile_template_conflicts": conflicts,
@@ -464,12 +473,13 @@ class DAFEngine:
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         def _mutator(
-            state: ProjectWorkspaceState, _conn: sqlite3.Connection
+            state: ProjectWorkspaceState, conn: sqlite3.Connection
         ) -> tuple[dict[str, Any], str, dict[str, Any]]:
             reg_out = ContextManager.register_or_update_evidence_items(
                 state,
                 evidence_items,
                 allow_source_replacement=allow_source_replacement,
+                slice_lookup=lambda sid: self.store.get_source_slice(project_id, sid, include_text=True, conn=conn),
             )
             verified_ids = [item["evidence_id"] for item in reg_out["verified_items"]]
             unverified_ids = [item["evidence_id"] for item in reg_out["unverified_items"]]
@@ -513,12 +523,13 @@ class DAFEngine:
         page_size: int = 50,
         cursor: str | None = None,
     ) -> dict[str, Any]:
-        state = self.store.load_state(project_id)
+        state = self.store.load_state(project_id, hydrate_slices=False, hydrate_sections=False)
         return ContextManager.list_source_blocks(
             state=state,
             source_id=source_id,
             page_size=page_size,
             cursor=cursor,
+            store=self.store,
         )
 
     # 4d. get_source_block
@@ -530,13 +541,14 @@ class DAFEngine:
         max_chars: int = 6000,
         expected_sha256: str | None = None,
     ) -> dict[str, Any]:
-        state = self.store.load_state(project_id)
+        state = self.store.load_state(project_id, hydrate_slices=False, hydrate_sections=False)
         return ContextManager.get_source_block(
             state=state,
             slice_id=slice_id,
             start_char=start_char,
             max_chars=max_chars,
             expected_sha256=expected_sha256,
+            store=self.store,
         )
 
     # 4e. search_sources
@@ -549,7 +561,7 @@ class DAFEngine:
         cursor: str | None = None,
         match_mode: str = "literal",
     ) -> dict[str, Any]:
-        state = self.store.load_state(project_id)
+        state = self.store.load_state(project_id, hydrate_slices=False, hydrate_sections=False)
         return ContextManager.search_sources(
             state=state,
             query=query,
@@ -557,6 +569,7 @@ class DAFEngine:
             page_size=page_size,
             cursor=cursor,
             match_mode=match_mode,
+            store=self.store,
         )
 
     # 5. get_project_context
@@ -567,7 +580,11 @@ class DAFEngine:
         token_budget: int | None = None,
         max_context_chars: int | None = None,
     ) -> dict[str, Any]:
-        state = self.store.load_state(project_id)
+        state = self.store.load_state(
+            project_id,
+            hydrate_slices=(task_type == "plan_outline"),
+            hydrate_sections=(task_type == "global_review"),
+        )
         return ContextManager.build_project_context(
             state=SourcePolicyEvaluator.context_view(state),
             task_type=task_type,
@@ -681,6 +698,8 @@ class DAFEngine:
             idempotency_key=sub_obj.idempotency_key,
             request_payload=semantic_payload,
             simulate_mid_transaction_crash=simulate_mid_transaction_crash,
+            hydrate_slices=False,
+            hydrate_sections=True,
         )
 
     # 9. review_document (deterministic checks + creates pending SemanticReviewTasks)
@@ -706,7 +725,13 @@ class DAFEngine:
             )
             return res, summary, res["open_issue_counts"]
 
-        return self.store.transact_project(project_id, "review_document", _mutator)
+        return self.store.transact_project(
+            project_id,
+            "review_document",
+            _mutator,
+            hydrate_slices=False,
+            hydrate_sections=True,
+        )
 
     # 9b. list_semantic_review_tasks
     def list_semantic_review_tasks(
@@ -806,6 +831,7 @@ class DAFEngine:
                     "checklist_hash": checklist_hash,
                 },
                 hydrate_slices=False,
+                hydrate_sections=True,
             )
         except ContractValidationError as exc:
             if exc.code == "CLAIM_SUPPORT_CONFLICT":
@@ -954,8 +980,11 @@ class DAFEngine:
             section_diffs: list[dict[str, Any]] = []
             for sid, sec in sorted(state.section_versions.sections.items()):
                 prev_md = ""
-                if len(sec.history) >= 2:
-                    prev_md = sec.history[-2].content_markdown
+                if len(sec.history) >= 2 and sec.history[-2].content_hash:
+                    prev_md = self.store.get_blob(
+                        sec.history[-2].content_hash,
+                        owner_desc=f"section_history:{sid}@r{sec.history[-2].revision}",
+                    )
                 diff_text = "".join(
                     difflib.unified_diff(
                         prev_md.splitlines(keepends=True),
@@ -1083,7 +1112,7 @@ class DAFEngine:
     def get_project_status(self, project_id: str) -> dict[str, Any]:
         from daf.guidance.state_resolver import resolve_task_state
 
-        state = self.store.load_state(project_id, hydrate_slices=False)
+        state = self.store.load_state(project_id, hydrate_slices=False, hydrate_sections=False)
         ReviewManager.refresh_semantic_task_staleness(state)
         rules_by_id = {
             r.section_id: r
@@ -1157,7 +1186,7 @@ class DAFEngine:
             "state_version": state.state_version,
             "updated_at": state.updated_at,
             "source_document_count": len(state.source_registry.documents),
-            "source_slice_count": len(state.source_registry.slices),
+            "source_slice_count": sum(d.slice_count for d in state.source_registry.documents.values()),
             "verified_evidence_count": sum(
                 1 for e in state.evidence_ledger.items.values() if e.excerpt_match_status == "matched"
             ),
@@ -1332,7 +1361,13 @@ class DAFEngine:
             res = {"job_id": job_id, "render_id": render_id, "phase": "prepared"}
             return res, f"Prepared RenderJob '{job_id}' ({render_id}).", res
 
-        self.store.transact_project(project_id, "render_prepare", _prepare_mutator)
+        self.store.transact_project(
+            project_id,
+            "render_prepare",
+            _prepare_mutator,
+            hydrate_slices=False,
+            hydrate_sections=True,
+        )
 
         state_snapshot: ProjectWorkspaceState = prepared_holder["state_snapshot"]
         job_id: str = prepared_holder["job_id"]
@@ -1442,7 +1477,13 @@ class DAFEngine:
             )
             return build_res, summary, build_res
 
-        fin_res = self.store.transact_project(project_id, "render_document", _finalize_mutator)
+        fin_res = self.store.transact_project(
+            project_id,
+            "render_document",
+            _finalize_mutator,
+            hydrate_slices=False,
+            hydrate_sections=True,
+        )
         if stale_error_holder:
             raise stale_error_holder[0]
         return fin_res
@@ -1644,7 +1685,13 @@ class DAFEngine:
             )
             return res, summary, res
 
-        return self.store.transact_project(project_id, "export_document", _export_mutator)
+        return self.store.transact_project(
+            project_id,
+            "export_document",
+            _export_mutator,
+            hydrate_slices=False,
+            hydrate_sections=True,
+        )
 
     # Unified Agent Tool Dispatcher (enforces non-privileged Agent domain boundary)
     # Unified compact helpers for streamlined MCP tool surface

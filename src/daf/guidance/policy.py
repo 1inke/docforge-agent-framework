@@ -121,7 +121,7 @@ class SourcePolicyEvaluator:
             sid: sl
             for sid, sl in view.source_registry.slices.items()
             if sl.source_id in allowed
-        }
+        } if view.source_registry.slices else {}
         view.evidence_ledger.items = {
             eid: ev
             for eid, ev in view.evidence_ledger.items.items()

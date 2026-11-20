@@ -188,25 +188,7 @@ def check_profile_template_conflicts(
     required_ids = {s.section_id for s in profile.structure_profile.required_sections}
     required_titles = {s.title for s in profile.structure_profile.required_sections}
 
-    if template_report.template_mode == "tagged":
-        detected = set(template_report.detected_placeholders)
-        missing_placeholders = [
-            sec_id
-            for sec_id in required_ids
-            if sec_id not in detected and f"section_{sec_id}" not in detected and "sections" not in detected
-        ]
-        if missing_placeholders and detected:
-            conflicts.append(
-                {
-                    "type": "tagged_template_placeholder_mismatch",
-                    "severity": "warning",
-                    "message": (
-                        f"Tagged template defines placeholders {sorted(detected)}, which do not directly "
-                        f"match required profile section IDs {sorted(missing_placeholders)}."
-                    ),
-                }
-            )
-    elif template_report.template_mode == "mapped":
+    if template_report.template_mode == "mapped":
         headings = set(template_report.heading_Anchors)
         cells = set(template_report.writable_table_cells)
         if not headings and not cells:
@@ -215,7 +197,7 @@ def check_profile_template_conflicts(
                     "type": "mapped_template_no_anchors",
                     "severity": "major",
                     "message": (
-                        "Template contains neither Jinja2 tags nor recognizable heading/table anchors. "
+                        "Template contains no recognizable heading or table anchors. "
                         "Explicit section_mapping is required to render into this template."
                     ),
                 }

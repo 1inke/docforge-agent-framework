@@ -173,6 +173,7 @@ class ProjectStore:
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self.db_path = self.workspace_root / "daf_workspace.sqlite3"
         self._blob_cache = _BlobLRUCache()
+        self._active_pending_blobs: dict[str, str] | None = None
         self._init_db()
 
     def _connect(self, autocommit: bool = False, readonly: bool = False) -> sqlite3.Connection:
@@ -228,6 +229,9 @@ class ProjectStore:
                     PRIMARY KEY (project_id, slice_id)
                 )
                 """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_source_slices_proj_src ON source_slices(project_id, source_id)"
             )
             conn.execute(
                 """
@@ -328,37 +332,15 @@ class ProjectStore:
         now_iso: str,
         pending_blobs: dict[str, str],
     ) -> str:
-        """Store immutable slice/section text blobs separately and return compact metadata-only JSON."""
+        """Store immutable section text blobs separately and keep slices exclusively in SQLite source_slices."""
         project_id = state.brief.project_id
         state_dict = state.model_dump(mode="json")
 
-        # 1. Offload source slices
-        slices_dict = state_dict.get("source_registry", {}).get("slices", {})
-        for slice_id, sl in slices_dict.items():
-            raw_text = sl.get("raw_text") or ""
-            sha = sl.get("sha256") or _sha256_text(raw_text)
-            sl["sha256"] = sha
-            if raw_text:
-                self._put_blob_in_tx(conn, sha, raw_text, now_iso, pending_blobs)
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO source_slices
-                    (project_id, slice_id, source_id, locator, char_count, blob_sha256)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        project_id,
-                        slice_id,
-                        sl.get("source_id", ""),
-                        sl.get("locator", ""),
-                        int(sl.get("char_count", len(raw_text))),
-                        sha,
-                    ),
-                )
-            sl["raw_text"] = ""
-            sl["normalized_text"] = ""
+        # 1. Source slice index & text live exclusively in SQLite source_slices + blobs
+        if "source_registry" in state_dict:
+            state_dict["source_registry"]["slices"] = {}
 
-        # 2. Offload section current & historical markdown
+        # 2. Offload section current & newly added historical markdown
         sections_dict = state_dict.get("section_versions", {}).get("sections", {})
         for sec_id, sec in sections_dict.items():
             cur_md = sec.get("content_markdown") or ""
@@ -368,7 +350,8 @@ class ProjectStore:
                 self._put_blob_in_tx(conn, chash, cur_md, now_iso, pending_blobs)
             sec["content_markdown"] = ""
 
-            for hist in sec.get("history") or []:
+            hist_list = sec.get("history") or []
+            for hist in hist_list:
                 h_md = hist.get("content_markdown") or ""
                 h_hash = hist.get("content_hash") or (_sha256_text(h_md) if h_md else "")
                 if h_md and h_hash:
@@ -390,8 +373,244 @@ class ProjectStore:
                         ),
                     )
                 hist["content_markdown"] = ""
+            if len(hist_list) > 5:
+                sec["history"] = hist_list[-5:]
 
         return json.dumps(state_dict, ensure_ascii=False, separators=(",", ":"))
+
+    def get_blob(self, sha256: str, *, conn: sqlite3.Connection | None = None, owner_desc: str = "") -> str:
+        """Fetch an immutable blob by SHA-256 (cache or SQLite blobs), raising StateCorruptedError if missing."""
+        if not sha256:
+            return ""
+        cached = self._blob_cache.get(sha256)
+        if cached is not None:
+            return cached
+        own_conn = conn is None
+        c = self._connect(readonly=True) if own_conn else conn
+        try:
+            row = c.execute("SELECT content FROM blobs WHERE sha256 = ?", (sha256,)).fetchone()
+            if row is None:
+                owner = owner_desc or "blob_ref"
+                raise StateCorruptedError(
+                    f"Missing content blob '{sha256}' referenced by {owner}.",
+                    details={"missing_blobs": [{"owner": owner, "sha256": sha256}]},
+                )
+            val = str(row["content"])
+            self._blob_cache.put(sha256, val)
+            return val
+        finally:
+            if own_conn:
+                c.close()
+
+    def write_source_slices_in_tx(
+        self,
+        conn: sqlite3.Connection,
+        project_id: str,
+        source_id: str,
+        slices: list[Any],
+        now_iso: str | None = None,
+        pending_blobs: dict[str, str] | None = None,
+    ) -> None:
+        """Write source slices exclusively into SQLite source_slices and blobs within the caller's tx."""
+        ts = now_iso or datetime.now(timezone.utc).isoformat()
+        pb = pending_blobs if pending_blobs is not None else self._active_pending_blobs
+        conn.execute(
+            "DELETE FROM source_slices WHERE project_id = ? AND source_id = ?",
+            (project_id, source_id),
+        )
+        blob_rows: list[tuple[str, str, str]] = []
+        slice_rows: list[tuple[str, str, str, str, int, str]] = []
+        for sl in slices:
+            raw_text = sl.raw_text or ""
+            sha = sl.sha256 or _sha256_text(raw_text)
+            if raw_text:
+                blob_rows.append((sha, raw_text, ts))
+                if pb is not None:
+                    pb[sha] = raw_text
+            slice_rows.append((project_id, sl.slice_id, source_id, sl.locator, int(sl.char_count), sha))
+        if blob_rows:
+            conn.executemany(
+                "INSERT OR IGNORE INTO blobs (sha256, content, created_at) VALUES (?, ?, ?)",
+                blob_rows,
+            )
+        if slice_rows:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO source_slices
+                (project_id, slice_id, source_id, locator, char_count, blob_sha256)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                slice_rows,
+            )
+
+    def count_source_slices(
+        self,
+        project_id: str,
+        source_id: str | None = None,
+        *,
+        conn: sqlite3.Connection | None = None,
+    ) -> int:
+        own_conn = conn is None
+        c = self._connect(readonly=True) if own_conn else conn
+        try:
+            if source_id is not None:
+                row = c.execute(
+                    "SELECT COUNT(*) AS cnt FROM source_slices WHERE project_id = ? AND source_id = ?",
+                    (project_id, source_id),
+                ).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT COUNT(*) AS cnt FROM source_slices WHERE project_id = ?",
+                    (project_id,),
+                ).fetchone()
+            return int(row["cnt"]) if row else 0
+        finally:
+            if own_conn:
+                c.close()
+
+    def list_source_slices(
+        self,
+        project_id: str,
+        source_ids: list[str] | None = None,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+        conn: sqlite3.Connection | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """List paginated slice metadata directly from SQLite source_slices without loading blobs."""
+        if source_ids is not None and len(source_ids) == 0:
+            return [], 0
+        own_conn = conn is None
+        c = self._connect(readonly=True) if own_conn else conn
+        try:
+            where = "project_id = ?"
+            params: list[Any] = [project_id]
+            if source_ids is not None:
+                ph = ",".join("?" for _ in source_ids)
+                where += f" AND source_id IN ({ph})"
+                params.extend(source_ids)
+            total = int(c.execute(f"SELECT COUNT(*) FROM source_slices WHERE {where}", params).fetchone()[0])
+            sql = f"SELECT slice_id, source_id, locator, char_count, blob_sha256 FROM source_slices WHERE {where} ORDER BY slice_id ASC"
+            q_params = list(params)
+            if limit is not None:
+                sql += " LIMIT ? OFFSET ?"
+                q_params.extend([int(limit), int(offset)])
+            rows = c.execute(sql, q_params).fetchall()
+            items = [
+                {
+                    "slice_id": str(r["slice_id"]),
+                    "source_id": str(r["source_id"]),
+                    "locator": str(r["locator"]),
+                    "char_count": int(r["char_count"]),
+                    "sha256": str(r["blob_sha256"]),
+                }
+                for r in rows
+            ]
+            return items, total
+        finally:
+            if own_conn:
+                c.close()
+
+    def get_source_slice(
+        self,
+        project_id: str,
+        slice_id: str,
+        *,
+        include_text: bool = True,
+        conn: sqlite3.Connection | None = None,
+    ) -> Any:
+        """O(1) SQLite primary-key lookup for a single SourceBlockSlice."""
+        from daf.core.contracts import SourceBlockSlice
+
+        own_conn = conn is None
+        c = self._connect(readonly=True) if own_conn else conn
+        try:
+            row = c.execute(
+                "SELECT slice_id, source_id, locator, char_count, blob_sha256 FROM source_slices WHERE project_id = ? AND slice_id = ?",
+                (project_id, slice_id),
+            ).fetchone()
+            if row is None:
+                return None
+            sha = str(row["blob_sha256"])
+            raw_text = (
+                self.get_blob(sha, conn=c, owner_desc=f"slice:{slice_id}")
+                if (include_text and sha)
+                else ""
+            )
+            return SourceBlockSlice(
+                slice_id=str(row["slice_id"]),
+                source_id=str(row["source_id"]),
+                locator=str(row["locator"]),
+                raw_text=raw_text,
+                normalized_text="",
+                char_count=int(row["char_count"]),
+                sha256=sha,
+            )
+        finally:
+            if own_conn:
+                c.close()
+
+    def iter_source_slices_with_text(
+        self,
+        project_id: str,
+        source_ids: list[str] | None = None,
+        *,
+        conn: sqlite3.Connection | None = None,
+    ) -> list[Any]:
+        """Load matching SourceBlockSlices with raw text via SQLite JOIN blobs."""
+        from daf.core.contracts import SourceBlockSlice
+
+        if source_ids is not None and len(source_ids) == 0:
+            return []
+        own_conn = conn is None
+        c = self._connect(readonly=True) if own_conn else conn
+        try:
+            where = "s.project_id = ?"
+            params: list[Any] = [project_id]
+            if source_ids is not None:
+                ph = ",".join("?" for _ in source_ids)
+                where += f" AND s.source_id IN ({ph})"
+                params.extend(source_ids)
+            rows = c.execute(
+                f"""
+                SELECT s.slice_id, s.source_id, s.locator, s.char_count, s.blob_sha256, b.content
+                FROM source_slices s
+                LEFT JOIN blobs b ON b.sha256 = s.blob_sha256
+                WHERE {where}
+                ORDER BY s.slice_id ASC
+                """,
+                params,
+            ).fetchall()
+            out: list[SourceBlockSlice] = []
+            missing_refs: list[dict[str, str]] = []
+            for r in rows:
+                sha = str(r["blob_sha256"])
+                content = r["content"]
+                if sha and content is None:
+                    missing_refs.append({"owner": f"slice:{r['slice_id']}", "sha256": sha})
+                    continue
+                if sha and content is not None:
+                    self._blob_cache.put(sha, str(content))
+                out.append(
+                    SourceBlockSlice(
+                        slice_id=str(r["slice_id"]),
+                        source_id=str(r["source_id"]),
+                        locator=str(r["locator"]),
+                        raw_text=str(content or ""),
+                        normalized_text="",
+                        char_count=int(r["char_count"]),
+                        sha256=sha,
+                    )
+                )
+            if missing_refs:
+                raise StateCorruptedError(
+                    f"SQLite state references {len(missing_refs)} missing slice blob(s): {missing_refs[:5]}",
+                    details={"missing_blobs": missing_refs},
+                )
+            return out
+        finally:
+            if own_conn:
+                c.close()
 
     def _fetch_blobs(self, conn: sqlite3.Connection, shas: set[str]) -> dict[str, str]:
         result: dict[str, str] = {}
@@ -424,30 +643,67 @@ class ProjectStore:
         state_dict: dict[str, Any],
         conn: sqlite3.Connection,
         *,
-        hydrate_slices: bool = True,
+        hydrate_slices: bool = False,
         hydrate_sections: bool = True,
     ) -> ProjectWorkspaceState:
         needed: set[str] = set()
-        slices_dict = state_dict.get("source_registry", {}).get("slices", {})
+        project_id = str(state_dict.get("brief", {}).get("project_id") or "")
+        src_reg = state_dict.setdefault("source_registry", {})
+        slices_dict = src_reg.get("slices", {})
         sections_dict = state_dict.get("section_versions", {}).get("sections", {})
 
+        missing_refs: list[dict[str, str]] = []
+
         if hydrate_slices:
-            for sl in slices_dict.values():
-                if not sl.get("raw_text") and sl.get("sha256"):
-                    needed.add(sl["sha256"])
+            slice_rows = (
+                conn.execute(
+                    """
+                    SELECT slice_id, source_id, locator, char_count, blob_sha256
+                    FROM source_slices
+                    WHERE project_id = ?
+                    ORDER BY slice_id ASC
+                    """,
+                    (project_id,),
+                ).fetchall()
+                if project_id
+                else []
+            )
+            if slice_rows:
+                shas = {str(r["blob_sha256"]) for r in slice_rows if r["blob_sha256"]}
+                blobs_sl = self._fetch_blobs(conn, shas) if shas else {}
+                hydrated_slices: dict[str, dict[str, Any]] = {}
+                for r in slice_rows:
+                    sl_id = str(r["slice_id"])
+                    sha = str(r["blob_sha256"])
+                    if sha and sha not in blobs_sl:
+                        missing_refs.append({"owner": f"slice:{sl_id}", "sha256": sha})
+                        continue
+                    hydrated_slices[sl_id] = {
+                        "slice_id": sl_id,
+                        "source_id": str(r["source_id"]),
+                        "locator": str(r["locator"]),
+                        "raw_text": blobs_sl.get(sha, ""),
+                        "normalized_text": "",
+                        "char_count": int(r["char_count"]),
+                        "sha256": sha,
+                    }
+                src_reg["slices"] = hydrated_slices
+            else:
+                for sl in slices_dict.values():
+                    if not sl.get("raw_text") and sl.get("sha256"):
+                        needed.add(sl["sha256"])
+        else:
+            src_reg["slices"] = {}
+
         if hydrate_sections:
             for sec in sections_dict.values():
                 if not sec.get("content_markdown") and sec.get("content_hash"):
                     needed.add(sec["content_hash"])
-                for hist in sec.get("history") or []:
-                    if not hist.get("content_markdown") and hist.get("content_hash"):
-                        needed.add(hist["content_hash"])
 
         blobs = self._fetch_blobs(conn, needed) if needed else {}
-        missing_refs: list[dict[str, str]] = []
 
-        if hydrate_slices:
-            for slice_id, sl in slices_dict.items():
+        if hydrate_slices and src_reg.get("slices"):
+            for slice_id, sl in src_reg["slices"].items():
                 sha = sl.get("sha256")
                 if not sl.get("raw_text") and sha:
                     if sha in blobs:
@@ -462,13 +718,6 @@ class ProjectStore:
                         sec["content_markdown"] = blobs[chash]
                     else:
                         missing_refs.append({"owner": f"section:{sec_id}@r{sec.get('revision', 0)}", "sha256": chash})
-                for hist in sec.get("history") or []:
-                    hhash = hist.get("content_hash")
-                    if not hist.get("content_markdown") and hhash:
-                        if hhash in blobs:
-                            hist["content_markdown"] = blobs[hhash]
-                        else:
-                            missing_refs.append({"owner": f"section_history:{sec_id}@r{hist.get('revision', 0)}", "sha256": hhash})
 
         if missing_refs:
             raise StateCorruptedError(
@@ -511,6 +760,7 @@ class ProjectStore:
 
         conn = self._connect(autocommit=True)
         pending_blobs: dict[str, str] = {}
+        self._active_pending_blobs = pending_blobs
         try:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
@@ -566,6 +816,7 @@ class ProjectStore:
                 pass
             raise
         finally:
+            self._active_pending_blobs = None
             conn.close()
 
         return state
@@ -579,8 +830,8 @@ class ProjectStore:
         idempotency_key: str | None = None,
         request_payload: Any | None = None,
         simulate_mid_transaction_crash: bool = False,
-        hydrate_slices: bool = True,
-        hydrate_sections: bool = True,
+        hydrate_slices: bool = False,
+        hydrate_sections: bool = False,
     ) -> dict[str, Any]:
         """Execute a read-validate-mutate-persist-audit cycle inside a single SQLite BEGIN IMMEDIATE transaction with CAS."""
         validate_safe_identifier(project_id, "project_id")
@@ -594,6 +845,7 @@ class ProjectStore:
 
         conn = self._connect(autocommit=True)
         pending_blobs: dict[str, str] = {}
+        self._active_pending_blobs = pending_blobs
         try:
             conn.execute("BEGIN IMMEDIATE")
 
@@ -716,6 +968,7 @@ class ProjectStore:
                 pass
             raise
         finally:
+            self._active_pending_blobs = None
             conn.close()
 
         return result_dict
@@ -724,7 +977,7 @@ class ProjectStore:
         self,
         project_id: str,
         *,
-        hydrate_slices: bool = True,
+        hydrate_slices: bool = False,
         hydrate_sections: bool = True,
     ) -> ProjectWorkspaceState:
         """Read-only load of authoritative state from SQLite (never resurrects from JSON snapshots)."""
@@ -813,6 +1066,7 @@ class ProjectStore:
         return {
             "project_id": project_id,
             "ok": len(missing) == 0,
+            "healthy": len(missing) == 0,
             "checked_refs": len(refs),
             "unique_blobs": len(all_shas),
             "missing_blobs": missing,

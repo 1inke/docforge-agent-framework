@@ -8,7 +8,7 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import docx
 
@@ -537,7 +537,7 @@ class ContextManager:
             file_path=str(resolved),
             file_sha256=file_sha,
             file_type=ext.lstrip("."),
-            slice_ids=[s.slice_id for s in slices],
+            slice_count=len(slices),
             is_agent_generated_summary=is_agent_generated_summary,
         )
         return doc_record, slices
@@ -645,18 +645,18 @@ class ContextManager:
                     for sl in slices:
                         sl.source_id = old_id
                         sl.slice_id = re.sub(r"^[^_]+(?:_[^_]+)*_s(\d+)$", f"{old_id}_s\\1", sl.slice_id)
-                    doc_rec.slice_ids = [s.slice_id for s in slices]
                     break
 
+        doc_rec.slice_count = len(slices)
         sha_changed = previous_doc is not None and previous_doc.file_sha256 != doc_rec.file_sha256
 
-        if previous_doc is not None:
-            for old_sid in previous_doc.slice_ids:
-                state.source_registry.slices.pop(old_sid, None)
+        # Clear any transient hydrated slices for re-ingested source; authoritative slice index is SQLite source_slices.
+        for old_sid in [
+            k for k, v in state.source_registry.slices.items() if v.source_id == doc_rec.source_id
+        ]:
+            state.source_registry.slices.pop(old_sid, None)
 
         state.source_registry.documents[doc_rec.source_id] = doc_rec
-        for sl in slices:
-            state.source_registry.slices[sl.slice_id] = sl
 
         invalidated_evidence_ids: list[str] = []
         if sha_changed:
@@ -708,6 +708,7 @@ class ContextManager:
         raw_items: list[dict[str, Any]],
         *,
         allow_source_replacement: bool = False,
+        slice_lookup: Callable[[str], SourceBlockSlice | None] | None = None,
     ) -> dict[str, Any]:
         """Register or update evidence items with versioning, idempotent no-op detection, and cascade invalidation."""
         verified_items: list[dict[str, Any]] = []
@@ -717,7 +718,7 @@ class ContextManager:
         affected_sections_all: set[str] = set()
 
         for raw in raw_items:
-            ev_item = cls.verify_and_build_evidence(state, raw)
+            ev_item = cls.verify_and_build_evidence(state, raw, slice_lookup=slice_lookup)
             existing = state.evidence_ledger.items.get(ev_item.evidence_id)
 
             if existing is not None:
@@ -967,10 +968,15 @@ class ContextManager:
                         if coord not in writable_cells:
                             writable_cells.append(coord)
 
-        template_mode: Literal["builtin", "tagged", "mapped"] = "tagged" if placeholders else "mapped"
-        if template_mode == "mapped" and not headings and not writable_cells:
+        template_mode: Literal["builtin", "mapped"] = "mapped"
+        if placeholders:
             warnings.append(
-                "Template has no Jinja2 tags and no recognizable headings or writable table cells."
+                f"Detected Jinja2 placeholders {placeholders}; 'tagged' mode is no longer supported — "
+                "use 'mapped' mode with explicit heading:/table: section_mapping targets."
+            )
+        if not headings and not writable_cells:
+            warnings.append(
+                "Template has no recognizable headings or writable table cells; explicit section_mapping is required."
             )
 
         return TemplateInspectionReport(
@@ -988,6 +994,8 @@ class ContextManager:
     def verify_and_build_evidence(
         state: ProjectWorkspaceState,
         raw_item: dict[str, Any],
+        *,
+        slice_lookup: Callable[[str], SourceBlockSlice | None] | None = None,
     ) -> EvidenceItem:
         """Verify L1 excerpt presence against SourceBlockSlice and set L3 source reliability."""
         evidence_id = validate_safe_identifier(str(raw_item["evidence_id"]), "evidence_id")
@@ -999,7 +1007,11 @@ class ContextManager:
         applicable_sections = list(raw_item.get("applicable_sections") or [])
 
         source_doc = state.source_registry.documents.get(source_id)
-        source_slice = state.source_registry.slices.get(slice_id)
+        source_slice = (
+            slice_lookup(slice_id)
+            if slice_lookup is not None
+            else state.source_registry.slices.get(slice_id)
+        )
         is_agent_summary = bool(
             raw_item.get("is_agent_generated_summary")
             or (source_doc and source_doc.is_agent_generated_summary)
@@ -1070,33 +1082,25 @@ class ContextManager:
 
     @classmethod
     def compute_source_index_revision(cls, state: ProjectWorkspaceState) -> str:
-        """Compute a deterministic revision fingerprint over the current SourceRegistry."""
+        """Compute a deterministic revision fingerprint over ingested source documents."""
         ordered_docs = [
             {
                 "source_id": doc.source_id,
                 "file_sha256": doc.file_sha256,
-                "slice_ids": list(doc.slice_ids),
+                "slice_count": doc.slice_count,
+                "ingested_at": doc.ingested_at,
             }
             for _, doc in sorted(state.source_registry.documents.items())
         ]
-        ordered_slices = [
-            {
-                "slice_id": sl.slice_id,
-                "source_id": sl.source_id,
-                "sha256": sl.sha256,
-                "char_count": sl.char_count,
-            }
-            for _, sl in sorted(state.source_registry.slices.items())
-        ]
-        digest = compute_canonical_json_hash({"docs": ordered_docs, "slices": ordered_slices})
+        digest = compute_canonical_json_hash({"docs": ordered_docs})
         return f"srcidx_{digest[:16]}"
 
     @classmethod
-    def _ordered_project_slices(
+    def _resolve_target_doc_ids(
         cls,
         state: ProjectWorkspaceState,
         source_ids: list[str] | None = None,
-    ) -> list[tuple[SourceDocumentRecord, SourceBlockSlice]]:
+    ) -> list[str]:
         if source_ids is not None:
             for sid in source_ids:
                 validate_safe_identifier(sid, "source_id")
@@ -1108,21 +1112,18 @@ class ContextManager:
             target_doc_ids = sorted(set(source_ids))
             for sid in target_doc_ids:
                 SourcePolicyEvaluator.assert_source(state, sid, "discover")
-        else:
-            target_doc_ids = sorted(SourcePolicyEvaluator.allowed_ids(state, "discover"))
+            return target_doc_ids
+        return sorted(SourcePolicyEvaluator.allowed_ids(state, "discover"))
 
+    @classmethod
+    def _ordered_project_slices(
+        cls,
+        state: ProjectWorkspaceState,
+        source_ids: list[str] | None = None,
+    ) -> list[tuple[SourceDocumentRecord, SourceBlockSlice]]:
+        target_doc_ids = set(cls._resolve_target_doc_ids(state, source_ids=source_ids))
         pairs: list[tuple[SourceDocumentRecord, SourceBlockSlice]] = []
-        seen_slices: set[str] = set()
-        for doc_id in target_doc_ids:
-            doc = state.source_registry.documents[doc_id]
-            for sl_id in doc.slice_ids:
-                sl = state.source_registry.slices.get(sl_id)
-                if sl is not None and sl.source_id == doc_id:
-                    pairs.append((doc, sl))
-                    seen_slices.add(sl_id)
         for sl_id in sorted(state.source_registry.slices.keys()):
-            if sl_id in seen_slices:
-                continue
             sl = state.source_registry.slices[sl_id]
             if sl.source_id not in target_doc_ids:
                 continue
@@ -1138,6 +1139,8 @@ class ContextManager:
         source_id: str | None = None,
         page_size: int = 50,
         cursor: str | None = None,
+        *,
+        store: Any = None,
     ) -> dict[str, Any]:
         """Return stable, paginated directory and metadata of ingested SourceBlockSlices without full raw text."""
         if not isinstance(page_size, int) or page_size < 1 or page_size > 100:
@@ -1146,7 +1149,7 @@ class ContextManager:
                 details={"page_size": page_size},
             )
         source_filter = [source_id] if source_id is not None else None
-        all_pairs = cls._ordered_project_slices(state, source_ids=source_filter)
+        target_doc_ids = cls._resolve_target_doc_ids(state, source_ids=source_filter)
         src_index_rev = cls.compute_source_index_revision(state)
         cursor_scope = canonical_hash({"index": src_index_rev, "policy": SourcePolicyEvaluator.revision(state),
                                        "source_ids": source_filter, "allowed": sorted(SourcePolicyEvaluator.allowed_ids(state, "discover"))})[7:23]
@@ -1172,39 +1175,72 @@ class ContextManager:
                     f"Invalid cursor offset '{offset_str}'.",
                     details={"cursor": cursor},
                 ) from exc
-            if offset < 0 or (offset > len(all_pairs) and len(all_pairs) > 0):
+            if offset < 0:
                 raise SourceQueryInvalidError(
-                    f"Cursor offset {offset} is out of range (total_count={len(all_pairs)}).",
-                    details={"cursor": cursor, "total_count": len(all_pairs)},
+                    f"Cursor offset {offset} is out of range.",
+                    details={"cursor": cursor},
                 )
 
-        page_slice = all_pairs[offset : offset + page_size]
-        next_offset = offset + len(page_slice)
+        if store is not None:
+            raw_items, total_count = store.list_source_slices(
+                state.brief.project_id,
+                source_ids=target_doc_ids,
+                limit=page_size,
+                offset=offset,
+            )
+            if offset > total_count and total_count > 0:
+                raise SourceQueryInvalidError(
+                    f"Cursor offset {offset} is out of range (total_count={total_count}).",
+                    details={"cursor": cursor, "total_count": total_count},
+                )
+            blocks = [
+                {
+                    "source_id": item["source_id"],
+                    "slice_id": item["slice_id"],
+                    "locator": item["locator"],
+                    "char_count": item["char_count"],
+                    "sha256": item["sha256"],
+                    "file_name": state.source_registry.documents[item["source_id"]].file_name,
+                    "source_file_sha256": state.source_registry.documents[item["source_id"]].file_sha256,
+                }
+                for item in raw_items
+                if item["source_id"] in state.source_registry.documents
+            ]
+        else:
+            all_pairs = cls._ordered_project_slices(state, source_ids=source_filter)
+            total_count = len(all_pairs)
+            if offset > total_count and total_count > 0:
+                raise SourceQueryInvalidError(
+                    f"Cursor offset {offset} is out of range (total_count={total_count}).",
+                    details={"cursor": cursor, "total_count": total_count},
+                )
+            page_slice = all_pairs[offset : offset + page_size]
+            blocks = [
+                {
+                    "source_id": doc.source_id,
+                    "slice_id": sl.slice_id,
+                    "locator": sl.locator,
+                    "char_count": sl.char_count,
+                    "sha256": sl.sha256,
+                    "file_name": doc.file_name,
+                    "source_file_sha256": doc.file_sha256,
+                }
+                for doc, sl in page_slice
+            ]
+
+        next_offset = offset + len(blocks)
         next_cursor = (
             f"lst:{cursor_scope}:{next_offset}"
-            if next_offset < len(all_pairs)
+            if next_offset < total_count
             else None
         )
-
-        blocks = [
-            {
-                "source_id": doc.source_id,
-                "slice_id": sl.slice_id,
-                "locator": sl.locator,
-                "char_count": sl.char_count,
-                "sha256": sl.sha256,
-                "file_name": doc.file_name,
-                "source_file_sha256": doc.file_sha256,
-            }
-            for doc, sl in page_slice
-        ]
 
         return {
             "project_id": state.brief.project_id,
             "blocks": blocks,
             "next_cursor": next_cursor,
             "has_more": next_cursor is not None,
-            "total_count": len(all_pairs),
+            "total_count": total_count,
             "source_index_revision": src_index_rev,
         }
 
@@ -1216,6 +1252,8 @@ class ContextManager:
         start_char: int = 0,
         max_chars: int = 6000,
         expected_sha256: str | None = None,
+        *,
+        store: Any = None,
     ) -> dict[str, Any]:
         """Return a character window `[start_char, end_char)` from an ingested SourceBlockSlice."""
         if not slice_id or not isinstance(slice_id, str):
@@ -1228,7 +1266,11 @@ class ContextManager:
                 details={"project_id": state.brief.project_id, "slice_id": slice_id},
             ) from exc
 
-        sl = state.source_registry.slices.get(slice_id)
+        sl = (
+            store.get_source_slice(state.brief.project_id, slice_id, include_text=True)
+            if store is not None
+            else state.source_registry.slices.get(slice_id)
+        )
         if sl is None or sl.source_id not in state.source_registry.documents:
             raise SourceSliceNotFoundError(
                 f"Source slice '{slice_id}' not found in project '{state.brief.project_id}'.",
@@ -1301,6 +1343,8 @@ class ContextManager:
         page_size: int = 20,
         cursor: str | None = None,
         match_mode: str = "literal",
+        *,
+        store: Any = None,
     ) -> dict[str, Any]:
         """Perform local deterministic literal substring search across ingested SourceBlockSlices."""
         if not isinstance(query, str) or not query.strip():
@@ -1325,7 +1369,15 @@ class ContextManager:
                 details={"page_size": page_size},
             )
 
-        all_pairs = cls._ordered_project_slices(state, source_ids=source_ids)
+        target_doc_ids = cls._resolve_target_doc_ids(state, source_ids=source_ids)
+        if store is not None:
+            all_pairs = [
+                (state.source_registry.documents[sl.source_id], sl)
+                for sl in store.iter_source_slices_with_text(state.brief.project_id, source_ids=target_doc_ids)
+                if sl.source_id in state.source_registry.documents
+            ]
+        else:
+            all_pairs = cls._ordered_project_slices(state, source_ids=source_ids)
         src_index_rev = cls.compute_source_index_revision(state)
         query_hash = compute_sha256_text(f"{match_mode}:{clean_query.casefold()}")[:12]
         cursor_scope = canonical_hash({"index": src_index_rev, "policy": SourcePolicyEvaluator.revision(state),
@@ -1836,7 +1888,7 @@ class ContextManager:
                 "file_name": doc.file_name,
                 "file_type": doc.file_type,
                 "file_sha256": doc.file_sha256,
-                "slice_count": len(doc.slice_ids),
+                "slice_count": doc.slice_count,
             }
             for _, doc in sorted(state.source_registry.documents.items())
         ]
@@ -2001,7 +2053,7 @@ class ContextManager:
                 "file_name": doc.file_name,
                 "file_type": doc.file_type,
                 "file_sha256": doc.file_sha256,
-                "slice_count": len(doc.slice_ids),
+                "slice_count": doc.slice_count,
             }
             for _, doc in sorted(state.source_registry.documents.items())
         ]
@@ -2165,7 +2217,7 @@ class ContextManager:
             "source_navigation": {
                 "source_index_revision": src_index_rev,
                 "total_sources": len(source_summaries),
-                "total_slices": len(state.source_registry.slices),
+                "total_slices": sum(d.slice_count for d in state.source_registry.documents.values()),
                 "tools": ["list_source_blocks", "get_source_block", "search_sources", "get_section_content"],
             },
             "sources": source_summaries,

@@ -1,4 +1,4 @@
-"""Unified DocumentIR -> DOCX Compiler (Builtin / Tagged / Mapped), RenderManifest Snapshot Binder & Isolated PDF Exporter."""
+"""Unified Single-Pass Pandoc DOCX Compiler (Builtin / Mapped), RenderManifest Binder & Isolated PDF Exporter."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -24,9 +23,6 @@ from docx.shared import Inches, Pt
 
 from daf.context_manager.manager import JINJA_TAG_PATTERN, compute_canonical_json_hash
 from daf.core.contracts import (
-    DocumentIR,
-    IRBlock,
-    IRSection,
     LayoutProfile,
     ProjectWorkspaceState,
     RenderManifest,
@@ -37,11 +33,17 @@ from daf.core.errors import (
     PandocUnavailableError,
     TemplateRenderError,
 )
-from daf.document_engine.ir import build_document_ir
+from daf.document_engine.pandoc_renderer import (
+    render_document_single_pass_pandoc,
+    render_mapped_sections_single_pass_pandoc,
+)
 from daf.project_store.store import validate_safe_docx_filename
-from daf.workflow_engine.state_machine import compute_final_draft_aggregate_hash
+from daf.workflow_engine.state_machine import (
+    compute_final_draft_aggregate_hash,
+    effective_section_ids,
+)
 
-RENDERER_VERSION = "daf-docx-ir-v2"
+RENDERER_VERSION = "daf-docx-pandoc-v2"
 LATEX_MATH_PATTERN = re.compile(r"(\$\$[\s\S]+?\$\$|(?<!\\)\$[^\$\n]+?(?<!\\)\$)")
 PREVIEW_BANNER_TEXT = "[PREVIEW DRAFT - UNAPPROVED / 内部预览草稿 - 未经人工最终批准]"
 
@@ -51,7 +53,7 @@ def _sha256_file(path: Path) -> str:
 
 
 def _canonicalize_docx_zip(path: Path) -> None:
-    """Repack a.docx zip archive in memory with sorted entry names and a fixed DOS timestamp so identical XML content yields an identical SHA-256."""
+    """Repack a .docx zip archive in memory with sorted entry names and a fixed DOS timestamp."""
     fixed_dt = (2026, 1, 1, 0, 0, 0)
     raw = path.read_bytes()
     entries: list[tuple[str, bytes]] = []
@@ -121,6 +123,33 @@ def enforce_run_font_uniformity(
     return sanitized_count
 
 
+def _ordered_drafted_sections(state: ProjectWorkspaceState) -> list[Any]:
+    ordered_ids = effective_section_ids(state) or list(state.section_versions.sections.keys())
+    seen: set[str] = set()
+    sections: list[Any] = []
+    for sid in ordered_ids:
+        sec = state.section_versions.sections.get(sid)
+        if sec is not None and sec.revision > 0:
+            sections.append(sec)
+            seen.add(sid)
+    for sid, sec in state.section_versions.sections.items():
+        if sid not in seen and sec.revision > 0:
+            sections.append(sec)
+    return sections
+
+
+def _plaintext_lines_from_markdown(md_text: str) -> list[str]:
+    lines: list[str] = []
+    for raw in md_text.splitlines():
+        s = raw.strip()
+        if not s or s.startswith(":::"):
+            continue
+        s = re.sub(r"^#{1,6}\s+", "", s)
+        s = s.replace("[@hypothesis]", "")
+        lines.append(s)
+    return lines
+
+
 def compute_render_input_fingerprint(
     state: ProjectWorkspaceState,
     purpose: Literal["preview", "release"] = "release",
@@ -135,16 +164,27 @@ def compute_render_input_fingerprint(
         effective_mode = tpl_report.template_mode if tpl_report is not None else "builtin"
 
     live_template_sha = ""
-    if effective_mode in {"tagged", "mapped"} and tpl_report is not None:
+    if effective_mode == "mapped" and tpl_report is not None:
         tpl_path = Path(tpl_report.template_path)
         if tpl_path.exists() and tpl_path.is_file():
             live_template_sha = _sha256_file(tpl_path)
         else:
             live_template_sha = "missing_template"
 
-    ir = build_document_ir(state, purpose=purpose)
-    section_hashes = {s.section_id: f"sha256:{s.content_hash}" for s in ir.sections}
-    ordered_ir_payload = [s.model_dump(mode="json") for s in ir.sections]
+    sections = _ordered_drafted_sections(state)
+    section_hashes = {s.section_id: f"sha256:{s.content_hash}" for s in sections}
+    ordered_payload = [
+        {
+            "section_id": s.section_id,
+            "title": s.title,
+            "revision": s.revision,
+            "content_hash": s.content_hash,
+        }
+        for s in sections
+    ]
+    expected_eq_count = sum(
+        len(LATEX_MATH_PATTERN.findall(s.content_markdown)) for s in sections
+    )
 
     profile_hash = f"sha256:{compute_canonical_json_hash(state.profile.model_dump(mode='json'))}"
     outline_hash = f"sha256:{state.outline_graph.outline_hash}"
@@ -162,7 +202,7 @@ def compute_render_input_fingerprint(
             "outline_hash": outline_hash,
             "profile_hash": profile_hash,
             "document_title": state.brief.title,
-            "ordered_ir_sections": ordered_ir_payload,
+            "ordered_sections": ordered_payload,
         }
     )
     return {
@@ -175,12 +215,13 @@ def compute_render_input_fingerprint(
         "template_sha256": f"sha256:{live_template_sha}" if live_template_sha else "",
         "raw_template_sha256": live_template_sha,
         "section_mapping_hash": mapping_hash,
-        "ir": ir,
+        "ordered_section_ids": [s.section_id for s in sections],
+        "expected_equation_count": expected_eq_count,
     }
 
 
 class DocumentEngine:
-    """Compiles DocumentIR into native Word (.docx) across Builtin / Tagged / Mapped modes with RenderManifest verification."""
+    """Compiles drafted Markdown into native Word (.docx) across Builtin and Mapped modes via single-pass Pandoc."""
 
     @staticmethod
     def configure_document_styles(doc: docx.Document, layout: LayoutProfile) -> None:
@@ -197,16 +238,19 @@ class DocumentEngine:
         rfonts.set(qn("w:eastAsia"), layout.cjk_font)
 
         for section in doc.sections:
-            section.top_margin = Inches(1.0)
-            section.bottom_margin = Inches(1.0)
-            section.left_margin = Inches(1.0)
-            section.right_margin = Inches(1.0)
+            section.top_margin = Inches(layout.margin_top_in)
+            section.bottom_margin = Inches(layout.margin_bottom_in)
+            section.left_margin = Inches(layout.margin_left_in)
+            section.right_margin = Inches(layout.margin_right_in)
 
-        for level in (1, 2, 3):
+        heading_sizes = {1: 16.0, 2: 14.0, 3: 12.0}
+        for level, sz in heading_sizes.items():
             style_name = f"Heading {level}"
             if style_name in doc.styles:
                 h_style = doc.styles[style_name]
                 h_style.font.name = layout.latin_font
+                h_style.font.size = Pt(sz)
+                h_style.font.bold = True
                 if h_style._element.rPr is None:
                     h_style._element.get_or_add_rPr()
                 h_rfonts = h_style._element.rPr.get_or_add_rFonts()
@@ -214,288 +258,6 @@ class DocumentEngine:
                 h_rfonts.set(qn("w:hAnsi"), layout.latin_font)
                 h_rfonts.set(qn("w:cs"), layout.latin_font)
                 h_rfonts.set(qn("w:eastAsia"), layout.heading_cjk_font)
-
-    @classmethod
-    def _compile_markdown_fragment_to_elements(
-        cls,
-        markdown_text: str,
-        layout: LayoutProfile,
-        degradation_mode: Literal["strict", "preview_plaintext"] = "strict",
-        pandoc_bin_override: str | None = "AUTO",
-    ) -> tuple[list[Any], int, int]:
-        """Compile a Markdown / LaTeX fragment into detached, font-sanitized OpenXML (<w:p>, <w:tbl>) elements.
-
-        Never mutates any caller document directly, preventing tail-append displacement bugs in mapped/tagged modes.
-        """
-        if not markdown_text.strip():
-            return [], 0, 0
-
-        has_math = bool(LATEX_MATH_PATTERN.search(markdown_text))
-        pandoc_bin = shutil.which("pandoc") if pandoc_bin_override == "AUTO" else pandoc_bin_override
-
-        if pandoc_bin is None and has_math and (
-            degradation_mode == "strict" or layout.equation_mode == "pandoc_omml"
-        ):
-            if degradation_mode == "strict":
-                raise PandocUnavailableError(
-                    "Document contains LaTeX math formulas ($...$ or $$...$$) and degradation_mode='strict', "
-                    "but 'pandoc' executable is unavailable. Refusing silent plaintext degradation.",
-                    details={"equation_mode": layout.equation_mode, "degradation_mode": degradation_mode},
-                )
-
-        elements: list[Any] = []
-        omml_count = 0
-        runs_sanitized = 0
-
-        if pandoc_bin is not None:
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                tmp_path = Path(tmp_dir)
-                md_file = tmp_path / "fragment.md"
-                docx_file = tmp_path / "fragment.docx"
-                md_file.write_text(markdown_text, encoding="utf-8")
-
-                proc = subprocess.run(
-                    [
-                        pandoc_bin,
-                        str(md_file),
-                        "-f",
-                        "markdown+tex_math_dollars",
-                        "-t",
-                        "docx",
-                        "-o",
-                        str(docx_file),
-                    ],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                )
-                if proc.returncode != 0 or not docx_file.exists():
-                    raise TemplateRenderError(
-                        f"Pandoc compilation failed (exit {proc.returncode}): {proc.stderr.strip()}",
-                        code="RENDER_DEPENDENCY_MISSING",
-                    )
-
-                frag_doc = docx.Document(str(docx_file))
-                m_oMath = qn("m:oMath")
-                m_oMathPara = qn("m:oMathPara")
-                w_p = qn("w:p")
-                w_tbl = qn("w:tbl")
-                r_embed = qn("r:embed")
-                r_id = qn("r:id")
-
-                for child in list(frag_doc._body._body):
-                    if child.tag not in {w_p, w_tbl}:
-                        continue
-                    cloned = copy.deepcopy(child)
-                    # Strip any dangling external relationship attributes on cloned fragment nodes
-                    for el in cloned.iter():
-                        for rattr in (r_embed, r_id):
-                            if rattr in el.attrib:
-                                del el.attrib[rattr]
-
-                    is_heading = False
-                    pPr = cloned.find(qn("w:pPr"))
-                    if pPr is not None:
-                        pStyle = pPr.find(qn("w:pStyle"))
-                        if pStyle is not None:
-                            val = pStyle.get(qn("w:val"), "")
-                            if "Heading" in val or "heading" in val:
-                                is_heading = True
-                    cjk_target = layout.heading_cjk_font if is_heading else layout.cjk_font
-                    runs_sanitized += enforce_run_font_uniformity(
-                        cloned,
-                        latin_font=layout.latin_font,
-                        cjk_font=cjk_target,
-                    )
-                    omml_count += len(list(cloned.iter(m_oMath))) + len(list(cloned.iter(m_oMathPara)))
-                    elements.append(cloned)
-        else:
-            # Scratch document fallback (only reached when has_math is False or degradation_mode == 'preview_plaintext')
-            scratch_doc = docx.Document()
-            for block in markdown_text.split("\n\n"):
-                clean_block = block.strip()
-                if not clean_block:
-                    continue
-                if clean_block.startswith("### "):
-                    p = scratch_doc.add_heading(clean_block[4:].strip(), level=3)
-                    cjk_f = layout.heading_cjk_font
-                elif clean_block.startswith("## "):
-                    p = scratch_doc.add_heading(clean_block[3:].strip(), level=2)
-                    cjk_f = layout.heading_cjk_font
-                elif clean_block.startswith("# "):
-                    p = scratch_doc.add_heading(clean_block[2:].strip(), level=1)
-                    cjk_f = layout.heading_cjk_font
-                else:
-                    p = scratch_doc.add_paragraph(clean_block)
-                    cjk_f = layout.cjk_font
-                runs_sanitized += enforce_run_font_uniformity(
-                    p._p, latin_font=layout.latin_font, cjk_font=cjk_f
-                )
-                elements.append(copy.deepcopy(p._p))
-
-        return elements, omml_count, runs_sanitized
-
-    @classmethod
-    def render_ir_block_to_elements(
-        cls,
-        block: IRBlock,
-        layout: LayoutProfile,
-        degradation_mode: Literal["strict", "preview_plaintext"] = "strict",
-        pandoc_bin_override: str | None = "AUTO",
-    ) -> tuple[list[Any], int, int, int]:
-        """Compile a single IRBlock into detached OpenXML elements (`<w:p>`, `<w:tbl>`).
-
-        Returns `(elements, omml_count, tables_count, runs_sanitized)`.
-        """
-        elements: list[Any] = []
-        omml_count = 0
-        tables_count = 0
-        runs_sanitized = 0
-
-        if block.block_type == "heading":
-            prefix = "#" * min(3, max(1, block.level))
-            els, omml, san = cls._compile_markdown_fragment_to_elements(
-                f"{prefix} {block.text}",
-                layout=layout,
-                degradation_mode=degradation_mode,
-                pandoc_bin_override=pandoc_bin_override,
-            )
-            elements.extend(els)
-            omml_count += omml
-            runs_sanitized += san
-
-        elif block.block_type == "paragraph":
-            els, omml, san = cls._compile_markdown_fragment_to_elements(
-                block.text,
-                layout=layout,
-                degradation_mode=degradation_mode,
-                pandoc_bin_override=pandoc_bin_override,
-            )
-            elements.extend(els)
-            omml_count += omml
-            runs_sanitized += san
-
-        elif block.block_type == "list":
-            md_lines = [
-                (f"{i}. {item}" if block.list_ordered else f"- {item}")
-                for i, item in enumerate(block.list_items, start=1)
-            ]
-            els, omml, san = cls._compile_markdown_fragment_to_elements(
-                "\n".join(md_lines),
-                layout=layout,
-                degradation_mode=degradation_mode,
-                pandoc_bin_override=pandoc_bin_override,
-            )
-            elements.extend(els)
-            omml_count += omml
-            runs_sanitized += san
-
-        elif block.block_type == "equation":
-            tex = block.latex.strip().removeprefix("$$").removesuffix("$$").strip()
-            els, omml, san = cls._compile_markdown_fragment_to_elements(
-                f"$$\n{tex}\n$$",
-                layout=layout,
-                degradation_mode=degradation_mode,
-                pandoc_bin_override=pandoc_bin_override,
-            )
-            elements.extend(els)
-            omml_count += omml
-            runs_sanitized += san
-            if block.caption:
-                scratch = docx.Document()
-                cap_p = scratch.add_paragraph(f"公式：{block.caption}")
-                runs_sanitized += enforce_run_font_uniformity(
-                    cap_p._p, layout.latin_font, layout.cjk_font
-                )
-                elements.append(copy.deepcopy(cap_p._p))
-
-        elif block.block_type == "table":
-            scratch = docx.Document()
-            if block.caption and layout.table_caption_style == "above_table":
-                cap_p = scratch.add_paragraph(f"表：{block.caption}")
-                runs_sanitized += enforce_run_font_uniformity(
-                    cap_p._p, layout.latin_font, layout.heading_cjk_font
-                )
-                elements.append(copy.deepcopy(cap_p._p))
-
-            cols = len(block.table_headers) or (len(block.table_rows[0]) if block.table_rows else 1)
-            rows_count = (1 if block.table_headers else 0) + len(block.table_rows)
-            if rows_count > 0 and cols > 0:
-                tbl = scratch.add_table(rows=rows_count, cols=cols)
-                row_offset = 0
-                if block.table_headers:
-                    for c_i, h_text in enumerate(block.table_headers[:cols]):
-                        tbl.cell(0, c_i).text = str(h_text)
-                    row_offset = 1
-                for r_i, row_data in enumerate(block.table_rows):
-                    for c_i, cell_val in enumerate(row_data[:cols]):
-                        tbl.cell(r_i + row_offset, c_i).text = str(cell_val)
-                runs_sanitized += enforce_run_font_uniformity(
-                    tbl._tbl, layout.latin_font, layout.cjk_font
-                )
-                elements.append(copy.deepcopy(tbl._tbl))
-                tables_count += 1
-
-            if block.caption and layout.table_caption_style == "below_table":
-                cap_p = scratch.add_paragraph(f"表：{block.caption}")
-                runs_sanitized += enforce_run_font_uniformity(
-                    cap_p._p, layout.latin_font, layout.heading_cjk_font
-                )
-                elements.append(copy.deepcopy(cap_p._p))
-
-        elif block.block_type in {"figure_ref", "caption"}:
-            scratch = docx.Document()
-            p = scratch.add_paragraph(block.text or f"图：{block.caption}")
-            runs_sanitized += enforce_run_font_uniformity(
-                p._p, layout.latin_font, layout.cjk_font
-            )
-            elements.append(copy.deepcopy(p._p))
-
-        elif block.block_type == "page_break":
-            scratch = docx.Document()
-            p = scratch.add_page_break()
-            elements.append(copy.deepcopy(p._p))
-
-        return elements, omml_count, tables_count, runs_sanitized
-
-    @classmethod
-    def render_ir_section_to_elements(
-        cls,
-        ir_section: IRSection,
-        layout: LayoutProfile,
-        include_section_heading: bool = True,
-        degradation_mode: Literal["strict", "preview_plaintext"] = "strict",
-        pandoc_bin_override: str | None = "AUTO",
-    ) -> tuple[list[Any], int, int, int]:
-        """Compile an entire IRSection into an ordered sequence of detached OpenXML elements."""
-        sec_elements: list[Any] = []
-        total_omml = 0
-        total_tables = 0
-        total_sanitized = 0
-
-        if include_section_heading:
-            scratch = docx.Document()
-            h_p = scratch.add_heading(ir_section.title, level=1)
-            total_sanitized += enforce_run_font_uniformity(
-                h_p._p, layout.latin_font, layout.heading_cjk_font
-            )
-            sec_elements.append(copy.deepcopy(h_p._p))
-
-        for blk in ir_section.blocks:
-            els, omml, tbls, san = cls.render_ir_block_to_elements(
-                blk,
-                layout=layout,
-                degradation_mode=degradation_mode,
-                pandoc_bin_override=pandoc_bin_override,
-            )
-            sec_elements.extend(els)
-            total_omml += omml
-            total_tables += tbls
-            total_sanitized += san
-
-        return sec_elements, total_omml, total_tables, total_sanitized
 
     @staticmethod
     def _insert_elements_into_body(body_el: Any, elements: list[Any]) -> None:
@@ -518,7 +280,6 @@ class DocumentEngine:
         for el in elements:
             tc_el.append(el)
 
-        # OpenXML requires every <w:tc> to end with a <w:p>
         children_tags = [c.tag for c in tc_el]
         if not children_tags or children_tags[-1] != w_p:
             trailing_p = OxmlElement("w:p")
@@ -554,18 +315,18 @@ class DocumentEngine:
     def verify_rendered_docx_qa(
         cls,
         artifact_path: Path,
-        ir: DocumentIR,
+        expected_equation_count: int,
         effective_mode: str,
         degradation_mode: Literal["strict", "preview_plaintext"],
         template_path: Path | None = None,
         template_before_sha: str | None = None,
         initial_tail_paragraph_texts: list[str] | None = None,
+        allowed_tail_suffix_count: int = 0,
     ) -> dict[str, Any]:
-        """Run unified OpenXML & structural QA checks on the compiled.docx before atomic promotion."""
+        """Run unified OpenXML & structural QA checks on the compiled .docx before atomic promotion."""
         if not artifact_path.exists() or artifact_path.stat().st_size == 0:
             raise TemplateRenderError("Rendered DOCX file is missing or empty.")
 
-        # 1. Verify original template immutability
         if template_path is not None and template_before_sha is not None:
             after_sha = _sha256_file(template_path)
             if after_sha != template_before_sha:
@@ -573,11 +334,9 @@ class DocumentEngine:
                     "CRITICAL: Original template SHA-256 changed during rendering! Template immutability violated."
                 )
 
-        # 2. Re-open with python-docx
         doc = docx.Document(str(artifact_path))
         body = doc._body._body
 
-        # 3. Check for unrendered Jinja2 placeholders
         all_texts: list[str] = [p.text for p in doc.paragraphs]
         for tbl in doc.tables:
             for row in tbl.rows:
@@ -591,14 +350,13 @@ class DocumentEngine:
                 code="TEMPLATE_MAPPING_INVALID",
             )
 
-        # 4. Check OMML equations in strict mode
         m_oMath = qn("m:oMath")
         m_oMathPara = qn("m:oMathPara")
         omml_nodes = list(body.iter(m_oMath)) + list(body.iter(m_oMathPara))
-        if degradation_mode == "strict" and ir.expected_equation_count > 0:
+        if degradation_mode == "strict" and expected_equation_count > 0:
             if len(omml_nodes) == 0:
                 raise TemplateRenderError(
-                    f"Expected at least {ir.expected_equation_count} native OMML equations in strict mode, "
+                    f"Expected at least {expected_equation_count} native OMML equations in strict mode, "
                     "but found 0 <m:oMath> nodes in compiled DOCX.",
                     code="RENDER_DEPENDENCY_MISSING",
                 )
@@ -608,17 +366,15 @@ class DocumentEngine:
                     code="RENDER_DEPENDENCY_MISSING",
                 )
 
-        # 5. Check that w:hint is completely stripped across all w:rFonts
         w_rFonts = qn("w:rFonts")
         w_hint = qn("w:hint")
         for rfonts in body.iter(w_rFonts):
             if w_hint in rfonts.attrib:
                 raise TemplateRenderError("OpenXML QA failed: w:hint attribute was not stripped from w:rFonts.")
 
-        # 6. In mapped table mode, verify no section content was accidentally appended to the document tail
         if effective_mode == "mapped" and initial_tail_paragraph_texts is not None:
             current_body_paras = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-            if len(current_body_paras) > len(initial_tail_paragraph_texts):
+            if len(current_body_paras) > len(initial_tail_paragraph_texts) + allowed_tail_suffix_count:
                 raise TemplateRenderError(
                     "Mapped template QA failed: content was appended to the document tail outside mapped targets.",
                     code="TEMPLATE_MAPPING_INVALID",
@@ -648,7 +404,7 @@ class DocumentEngine:
         update_state_in_place: bool = True,
         simulate_crash_before_finalize: bool = False,
     ) -> dict[str, Any]:
-        """Compile DocumentIR into a native.docx via atomic.tmp promotion and record RenderManifest."""
+        """Compile drafted Markdown into a native .docx via single-pass Pandoc and atomic .tmp promotion."""
         if output_dir.exists() and output_dir.is_symlink():
             raise ArtifactPathInvalidError(
                 f"Security violation: output_dir '{output_dir}' cannot be a symbolic link."
@@ -668,7 +424,7 @@ class DocumentEngine:
         eff_degradation: Literal["strict", "preview_plaintext"] = (
             degradation_mode
             if degradation_mode is not None
-            else ("strict" if purpose == "release" else "strict")
+            else "strict"
         )
         if purpose == "release" and eff_degradation != "strict":
             raise TemplateRenderError(
@@ -684,22 +440,44 @@ class DocumentEngine:
             degradation_mode=eff_degradation,
         )
         effective_mode: str = fp_info["effective_template_mode"]
-        ir: DocumentIR = fp_info["ir"]
-        layout = state.profile.layout_profile
+        if effective_mode == "tagged":
+            raise TemplateRenderError(
+                "template_mode='tagged' is no longer supported; use 'builtin' or 'mapped'.",
+                code="TEMPLATE_MODE_UNSUPPORTED",
+            )
+        if effective_mode not in {"builtin", "mapped"}:
+            raise TemplateRenderError(
+                f"Unsupported template_mode '{effective_mode}'. Use 'builtin' or 'mapped'.",
+                code="TEMPLATE_MODE_UNSUPPORTED",
+            )
 
-        if not ir.sections:
+        sections = _ordered_drafted_sections(state)
+        if not sections:
             raise TemplateRenderError(
                 "Cannot render document: no drafted sections with revision > 0 exist.",
                 code="TEMPLATE_MAPPING_INVALID",
             )
 
+        resolved_pandoc_bin = (
+            None
+            if pandoc_bin_override == ""
+            else (shutil.which("pandoc") if pandoc_bin_override == "AUTO" else pandoc_bin_override)
+        )
+        if resolved_pandoc_bin is None:
+            if purpose == "release":
+                raise PandocUnavailableError(
+                    "Pandoc executable is required for official 'release' rendering."
+                )
+            eff_degradation = "preview_plaintext"
+
+        layout = state.profile.layout_profile
         tpl_report = state.source_registry.template_inspection
         template_path: Path | None = None
         template_before_sha: str | None = None
-        if effective_mode in {"tagged", "mapped"}:
+        if effective_mode == "mapped":
             if tpl_report is None:
                 raise TemplateRenderError(
-                    f"template_mode='{effective_mode}' requires an inspected .docx template.",
+                    "template_mode='mapped' requires an inspected .docx template.",
                     code="TEMPLATE_MAPPING_INVALID",
                 )
             template_path = Path(tpl_report.template_path)
@@ -734,156 +512,39 @@ class DocumentEngine:
 
         tmp_output_path = tmp_work_dir / f"tmp_{uuid.uuid4().hex[:10]}_{fname}"
 
-        total_omml = 0
         total_tables = 0
         total_runs_sanitized = 0
         initial_tail_paras: list[str] | None = None
+        allowed_tail_suffix_count = 0
 
         try:
             if effective_mode == "builtin":
-                if eff_degradation == "strict" and pandoc_bin_override != "":
-                    from daf.document_engine.pandoc_renderer import render_document_single_pass_pandoc
-
-                    p_override = None if pandoc_bin_override == "AUTO" else pandoc_bin_override
+                if eff_degradation == "strict" and resolved_pandoc_bin is not None:
                     render_document_single_pass_pandoc(
                         state=state,
                         output_docx_path=tmp_output_path,
                         purpose=purpose,
                         project_dir=output_dir.parent,
-                        pandoc_bin=p_override,
+                        pandoc_bin=resolved_pandoc_bin,
                     )
                     doc = docx.Document(str(tmp_output_path))
-                    cls._apply_preview_watermark_and_metadata(doc, purpose, eff_degradation, layout)
-                    total_runs_sanitized += enforce_run_font_uniformity(
-                        doc._body._body, layout.latin_font, layout.cjk_font
-                    )
-                    total_omml = sum(1 for _ in doc._body._body.iter(qn("m:oMath")))
-                    total_tables = len(doc.tables)
-                    doc.save(str(tmp_output_path))
                 else:
                     doc = docx.Document()
                     cls.configure_document_styles(doc, layout)
-                    cls._apply_preview_watermark_and_metadata(doc, purpose, eff_degradation, layout)
-
                     if purpose == "preview":
-                        banner_p = doc.add_paragraph(PREVIEW_BANNER_TEXT)
-                        total_runs_sanitized += enforce_run_font_uniformity(
-                            banner_p._p, layout.latin_font, layout.heading_cjk_font
-                        )
+                        doc.add_paragraph(PREVIEW_BANNER_TEXT)
+                    doc.add_heading(state.brief.title, level=0)
+                    for sec in sections:
+                        doc.add_heading(sec.title, level=1)
+                        for line in _plaintext_lines_from_markdown(sec.content_markdown):
+                            doc.add_paragraph(line)
 
-                    title_h = doc.add_heading(state.brief.title, level=0)
-                    total_runs_sanitized += enforce_run_font_uniformity(
-                        title_h._p, layout.latin_font, layout.heading_cjk_font
-                    )
-
-                    for ir_sec in ir.sections:
-                        sec_els, omml, tbls, san = cls.render_ir_section_to_elements(
-                            ir_sec,
-                            layout=layout,
-                            include_section_heading=True,
-                            degradation_mode=eff_degradation,
-                            pandoc_bin_override=pandoc_bin_override,
-                        )
-                        cls._insert_elements_into_body(doc._body._body, sec_els)
-                        total_omml += omml
-                        total_tables += tbls
-                        total_runs_sanitized += san
-
-                    total_runs_sanitized += enforce_run_font_uniformity(
-                        doc._body._body, layout.latin_font, layout.cjk_font
-                    )
-                    doc.save(str(tmp_output_path))
-
-            elif effective_mode == "tagged":
-                assert template_path is not None
-                shutil.copy2(template_path, tmp_output_path)
-                tagged_doc = docx.Document(str(tmp_output_path))
-                cls.configure_document_styles(tagged_doc, layout)
-                cls._apply_preview_watermark_and_metadata(tagged_doc, purpose, eff_degradation, layout)
-
-                # Build section IR lookup by placeholder tag name
-                sec_by_tag: dict[str, IRSection] = {}
-                for ir_sec in ir.sections:
-                    sec_by_tag[ir_sec.section_id] = ir_sec
-                    sec_by_tag[f"section_{ir_sec.section_id}"] = ir_sec
-                if section_mapping:
-                    for sec_id, tag_name in section_mapping.items():
-                        matched_sec = next((s for s in ir.sections if s.section_id == sec_id), None)
-                        if matched_sec is not None:
-                            sec_by_tag[tag_name] = matched_sec
-
-                scalar_vars = {
-                    "title": state.brief.title,
-                    "project_id": state.brief.project_id,
-                    "domain": state.brief.domain,
-                    "global_thesis": state.outline_graph.global_thesis,
-                }
-
-                # Helper to process paragraphs in body or inside table cells
-                def _process_tagged_paragraphs(paragraphs: list[Any], in_table_cell: bool = False) -> None:
-                    nonlocal total_omml, total_tables, total_runs_sanitized
-                    for para in list(paragraphs):
-                        raw_txt = para.text
-                        tags = JINJA_TAG_PATTERN.findall(raw_txt)
-                        if not tags:
-                            continue
-
-                        # Check if any tag is a section IR placeholder
-                        sec_tags = [t for t in tags if t in sec_by_tag]
-                        if sec_tags:
-                            if len(tags) > 1 or re.sub(JINJA_TAG_PATTERN, "", raw_txt).strip():
-                                raise TemplateRenderError(
-                                    f"Section placeholder '{{{{ {sec_tags[0]} }}}}' cannot be embedded inline with other text in the same paragraph. "
-                                    "Place section tags in their own dedicated paragraph or table cell.",
-                                    code="TEMPLATE_MAPPING_INVALID",
-                                )
-                            target_ir_sec = sec_by_tag[sec_tags[0]]
-                            sec_els, omml, tbls, san = cls.render_ir_section_to_elements(
-                                target_ir_sec,
-                                layout=layout,
-                                include_section_heading=not in_table_cell,
-                                degradation_mode=eff_degradation,
-                                pandoc_bin_override=pandoc_bin_override,
-                            )
-                            parent_el = para._p.getparent()
-                            for el in sec_els:
-                                para._p.addprevious(el)
-                            parent_el.remove(para._p)
-                            # Ensure table cell never becomes completely empty of <w:p>
-                            if in_table_cell and not any(c.tag == qn("w:p") for c in parent_el):
-                                parent_el.append(OxmlElement("w:p"))
-                            total_omml += omml
-                            total_tables += tbls
-                            total_runs_sanitized += san
-                        else:
-                            # Scalar replacement
-                            new_txt = raw_txt
-                            for t in tags:
-                                if t not in scalar_vars:
-                                    raise TemplateRenderError(
-                                        f"Unmapped Jinja2 placeholder '{{{{ {t} }}}}' in tagged template.",
-                                        code="TEMPLATE_MAPPING_INVALID",
-                                    )
-                                new_txt = re.sub(
-                                    r"\{\{\s*" + re.escape(t) + r"\s*\}\}",
-                                    str(scalar_vars[t]),
-                                    new_txt,
-                                )
-                            para.text = new_txt
-                            total_runs_sanitized += enforce_run_font_uniformity(
-                                para._p, layout.latin_font, layout.cjk_font
-                            )
-
-                _process_tagged_paragraphs(tagged_doc.paragraphs, in_table_cell=False)
-                for tbl in tagged_doc.tables:
-                    for row in tbl.rows:
-                        for cell in row.cells:
-                            _process_tagged_paragraphs(cell.paragraphs, in_table_cell=True)
-
+                cls._apply_preview_watermark_and_metadata(doc, purpose, eff_degradation, layout)
                 total_runs_sanitized += enforce_run_font_uniformity(
-                    tagged_doc._body._body, layout.latin_font, layout.cjk_font
+                    doc._body._body, layout.latin_font, layout.cjk_font
                 )
-                tagged_doc.save(str(tmp_output_path))
+                total_tables = len(doc.tables)
+                doc.save(str(tmp_output_path))
 
             elif effective_mode == "mapped":
                 assert template_path is not None
@@ -894,9 +555,8 @@ class DocumentEngine:
                         code="TEMPLATE_MAPPING_INVALID",
                     )
 
-                # Validate no duplicate mapping targets
                 used_targets: set[str] = set()
-                for sec_id, target_coord in section_mapping.items():
+                for _k, target_coord in section_mapping.items():
                     if target_coord in used_targets:
                         raise TemplateRenderError(
                             f"Duplicate mapping target '{target_coord}' in section_mapping.",
@@ -904,25 +564,44 @@ class DocumentEngine:
                         )
                     used_targets.add(target_coord)
 
+                for sec in sections:
+                    if not section_mapping.get(sec.section_id):
+                        raise TemplateRenderError(
+                            f"Missing explicit mapping in section_mapping for drafted section '{sec.section_id}'.",
+                            code="TEMPLATE_MAPPING_INVALID",
+                        )
+
                 shutil.copy2(template_path, tmp_output_path)
                 mapped_doc = docx.Document(str(tmp_output_path))
                 cls.configure_document_styles(mapped_doc, layout)
                 cls._apply_preview_watermark_and_metadata(mapped_doc, purpose, eff_degradation, layout)
 
-                all_table_Targets = all(
-                    section_mapping.get(s.section_id, "").startswith("table:") for s in ir.sections
+                all_table_targets = all(
+                    section_mapping.get(s.section_id, "").startswith("table:") for s in sections
                 )
-                if all_table_Targets:
+                if all_table_targets:
                     initial_tail_paras = [p.text.strip() for p in mapped_doc.paragraphs if p.text.strip()]
 
-                for ir_sec in ir.sections:
-                    target_loc = section_mapping.get(ir_sec.section_id)
-                    if not target_loc:
-                        raise TemplateRenderError(
-                            f"Missing explicit mapping in section_mapping for drafted section '{ir_sec.section_id}'.",
-                            code="TEMPLATE_MAPPING_INVALID",
-                        )
+                section_elements: dict[str, list[Any]]
+                bib_elements: list[Any]
+                if eff_degradation == "strict" and resolved_pandoc_bin is not None:
+                    mapped_res = render_mapped_sections_single_pass_pandoc(
+                        state=state,
+                        project_dir=output_dir.parent,
+                        pandoc_bin=resolved_pandoc_bin,
+                    )
+                    section_elements = mapped_res["section_elements"]
+                    bib_elements = mapped_res["bib_elements"]
+                else:
+                    section_elements = {}
+                    for sec in sections:
+                        scratch = docx.Document()
+                        for line in _plaintext_lines_from_markdown(sec.content_markdown):
+                            p = scratch.add_paragraph(line)
+                            section_elements.setdefault(sec.section_id, []).append(copy.deepcopy(p._p))
+                    bib_elements = []
 
+                def _inject_elements_at(target_loc: str, els: list[Any]) -> None:
                     if target_loc.startswith("table:"):
                         m = re.match(r"^table:(\d+):r(\d+):c(\d+)$", target_loc)
                         if not m:
@@ -938,19 +617,7 @@ class DocumentEngine:
                                 f"Table coordinate '{target_loc}' out of range for template.",
                                 code="TEMPLATE_MAPPING_INVALID",
                             ) from exc
-
-                        sec_els, omml, tbls, san = cls.render_ir_section_to_elements(
-                            ir_sec,
-                            layout=layout,
-                            include_section_heading=False,
-                            degradation_mode=eff_degradation,
-                            pandoc_bin_override=pandoc_bin_override,
-                        )
-                        cls._insert_elements_into_table_cell(cell._tc, sec_els, layout)
-                        total_omml += omml
-                        total_tables += tbls
-                        total_runs_sanitized += san
-
+                        cls._insert_elements_into_table_cell(cell._tc, els, layout)
                     elif target_loc.startswith("heading:"):
                         heading_needle = target_loc[len("heading:") :].strip()
                         matched_para = next(
@@ -962,46 +629,55 @@ class DocumentEngine:
                                 f"Mapped heading anchor '{heading_needle}' not found in template.",
                                 code="TEMPLATE_MAPPING_INVALID",
                             )
-                        sec_els, omml, tbls, san = cls.render_ir_section_to_elements(
-                            ir_sec,
-                            layout=layout,
-                            include_section_heading=False,
-                            degradation_mode=eff_degradation,
-                            pandoc_bin_override=pandoc_bin_override,
-                        )
                         anchor = matched_para._p
-                        for el in sec_els:
+                        for el in els:
                             anchor.addnext(el)
                             anchor = el
-                        total_omml += omml
-                        total_tables += tbls
-                        total_runs_sanitized += san
                     else:
                         raise TemplateRenderError(
                             f"Unsupported mapping target '{target_loc}'. Use 'table:<t>:r<r>:c<c>' or 'heading:<text>'.",
                             code="TEMPLATE_MAPPING_INVALID",
                         )
 
+                for sec in sections:
+                    _inject_elements_at(
+                        section_mapping[sec.section_id],
+                        section_elements.get(sec.section_id, []),
+                    )
+
+                if bib_elements:
+                    bib_target = section_mapping.get("__bibliography__") or section_mapping.get("references")
+                    if bib_target:
+                        _inject_elements_at(bib_target, bib_elements)
+                    else:
+                        scratch_bib = docx.Document()
+                        bib_h = scratch_bib.add_heading("参考文献", level=1)
+                        cls._insert_elements_into_body(mapped_doc._body._body, [copy.deepcopy(bib_h._p), *bib_elements])
+                        w_t = qn("w:t")
+                        allowed_tail_suffix_count = 1 + sum(
+                            1
+                            for el in bib_elements
+                            if "".join(t.text or "" for t in el.iter(w_t)).strip()
+                        )
+
                 total_runs_sanitized += enforce_run_font_uniformity(
                     mapped_doc._body._body, layout.latin_font, layout.cjk_font
                 )
+                total_tables = len(mapped_doc.tables)
                 mapped_doc.save(str(tmp_output_path))
-            else:
-                raise TemplateRenderError(f"Unsupported template_mode '{effective_mode}'.")
 
-            # Run unified OpenXML & structural QA before promoting from.tmp/
             _canonicalize_docx_zip(tmp_output_path)
             qa_report = cls.verify_rendered_docx_qa(
                 artifact_path=tmp_output_path,
-                ir=ir,
+                expected_equation_count=fp_info["expected_equation_count"],
                 effective_mode=effective_mode,
                 degradation_mode=eff_degradation,
                 template_path=template_path,
                 template_before_sha=template_before_sha,
                 initial_tail_paragraph_texts=initial_tail_paras,
+                allowed_tail_suffix_count=allowed_tail_suffix_count,
             )
 
-            # Atomically move verified.tmp file to final output path
             os.replace(str(tmp_output_path), str(final_output_path))
         finally:
             if tmp_output_path.exists():
@@ -1055,7 +731,7 @@ class DocumentEngine:
             "artifact_path": str(final_output_path),
             "artifact_sha256": output_sha,
             "input_fingerprint": fp_info["input_fingerprint"],
-            "sections_rendered": [s.section_id for s in ir.sections],
+            "sections_rendered": fp_info["ordered_section_ids"],
             "omml_equations_count": qa_report["omml_node_count"],
             "tables_rendered": total_tables,
             "runs_font_sanitized": total_runs_sanitized,
@@ -1065,7 +741,7 @@ class DocumentEngine:
 
     @staticmethod
     def export_pdf_via_word_com(source_docx_path: str | Path, pdf_path: str | Path, timeout_sec: int = 60) -> dict[str, Any]:
-        """Export a.docx file to.pdf on Windows using an isolated child process running Word COM."""
+        """Export a .docx file to .pdf on Windows using an isolated child process running Word COM."""
         src = Path(source_docx_path).resolve()
         dst = Path(pdf_path).resolve()
         if not src.exists():
@@ -1076,7 +752,6 @@ class DocumentEngine:
             )
 
         dst.parent.mkdir(parents=True, exist_ok=True)
-        # Remove any pre-existing target PDF first so an old PDF can NEVER be mistaken for a new export on failure
         tmp_pdf = dst.parent / f".tmp_{uuid.uuid4().hex[:8]}_{dst.name}"
         child_script = (
             "import sys, pythoncom, win32com.client\n"

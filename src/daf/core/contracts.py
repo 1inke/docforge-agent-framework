@@ -120,6 +120,10 @@ class LayoutProfile(StrictContractModel):
     body_font_size_pt: float = 12.0
     line_spacing: float = 1.5
     first_line_indent_chars: float = 2.0
+    margin_top_in: float = 1.0
+    margin_bottom_in: float = 1.0
+    margin_left_in: float = 1.25
+    margin_right_in: float = 1.25
     equation_mode: Literal["pandoc_omml", "plain_text_fallback"] = "pandoc_omml"
     table_caption_style: Literal["above_table", "below_table"] = "above_table"
     figure_caption_style: Literal["below_figure", "above_figure"] = "below_figure"
@@ -163,7 +167,7 @@ class SourceDocumentRecord(StrictContractModel):
     file_sha256: str
     file_type: str
     ingested_at: str = Field(default_factory=utc_now_iso)
-    slice_ids: list[str] = Field(default_factory=list)
+    slice_count: int = 0
     is_agent_generated_summary: bool = False
     bibliography: dict[str, Any] | None = None
     proposed_bibliography: dict[str, Any] | None = None
@@ -172,7 +176,7 @@ class SourceDocumentRecord(StrictContractModel):
 class TemplateInspectionReport(StrictContractModel):
     template_path: str
     template_sha256: str
-    template_mode: Literal["builtin", "tagged", "mapped"]
+    template_mode: Literal["builtin", "mapped"]
     detected_placeholders: list[str] = Field(default_factory=list)
     heading_Anchors: list[str] = Field(default_factory=list)
     writable_table_cells: list[str] = Field(default_factory=list)
@@ -411,15 +415,6 @@ class SourceBinding(StrictContractModel):
         if self.semantic_support_status == "supported_reviewed":
             return "supported"
         return self.semantic_support_status
-
-
-class StructuredBlock(StrictContractModel):
-    block_id: str
-    block_type: Literal["equation", "table", "figure_placeholder"]
-    caption: str = ""
-    latex: str = ""
-    table_headers: list[str] = Field(default_factory=list)
-    table_rows: list[list[str]] = Field(default_factory=list)
 
 
 class ReviewIssue(StrictContractModel):
@@ -695,52 +690,8 @@ class SectionVersions(StrictContractModel):
 
 
 # ============================================================================
-# 5. Document IR, RenderJob & RenderManifest
+# 5. RenderJob & RenderManifest
 # ============================================================================
-
-
-class IRBlock(StrictContractModel):
-    """Canonical block in DocumentIR for cross-mode rendering consistency."""
-
-    block_id: str
-    section_id: str
-    block_type: Literal[
-        "heading",
-        "paragraph",
-        "list",
-        "table",
-        "equation",
-        "figure_ref",
-        "caption",
-        "page_break",
-    ]
-    style_role: str = "body"
-    text: str = ""
-    level: int = 1
-    list_items: list[str] = Field(default_factory=list)
-    list_ordered: bool = False
-    latex: str = ""
-    table_headers: list[str] = Field(default_factory=list)
-    table_rows: list[list[str]] = Field(default_factory=list)
-    caption: str = ""
-    source_refs: list[str] = Field(default_factory=list)
-
-
-class IRSection(StrictContractModel):
-    section_id: str
-    title: str
-    revision: int
-    content_hash: str
-    blocks: list[IRBlock] = Field(default_factory=list)
-
-
-class DocumentIR(StrictContractModel):
-    project_id: str
-    title: str
-    purpose: Literal["preview", "release"] = "release"
-    sections: list[IRSection] = Field(default_factory=list)
-    expected_equation_count: int = 0
-    expected_table_count: int = 0
 
 
 class RenderJob(StrictContractModel):

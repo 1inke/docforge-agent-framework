@@ -12,7 +12,6 @@ from daf.core.contracts import (
     ChecklistItemSpec,
     ContextBudgetMetadata,
     DependencySnapshot,
-    DocumentIR,
     DocumentProfileContract,
     ProjectSourcePolicy,
     RenderManifest,
@@ -206,6 +205,7 @@ ERROR_CODE_CATALOG.extend([
         ("SECTION_NOT_IN_OUTLINE", "get_project_status", "Submitted section_id is not declared in the approved OutlineGraph."),
         ("REVIEWER_ID_REQUIRED", "start_review", "A distinct reviewer_id / reviewed_by (>= 3 characters) is required for semantic review."),
         ("REVIEWER_IS_AUTHOR", "claim_semantic_review_task", "The reviewer session cannot be empty or identical to the section's author_session."),
+        ("TEMPLATE_MODE_UNSUPPORTED", "render_document", "Requested template_mode is unsupported (only 'builtin' and 'mapped' are supported)."),
     ]
 ])
 
@@ -396,7 +396,7 @@ TOOL_CATALOG: list[dict[str, Any]] = [
         "category": "rendering",
         "mutates_state": True,
         "idempotent": False,
-        "description": "Compile DocumentIR into a native Word (.docx) document via recoverable out-of-transaction RenderJob and RenderManifest.",
+        "description": "Compile drafted sections into a native Word (.docx) document via recoverable out-of-transaction RenderJob and RenderManifest.",
     },
     {
         "name": "export_document",
@@ -441,7 +441,7 @@ class CapabilityRegistry:
             "pandoc_version_warning": pandoc_version_warning,
             "word_com_pdf_available": word_com_available,
             "supported_source_extensions": [".md", ".txt", ".docx", ".pdf"],
-            "supported_template_modes": ["builtin", "tagged", "mapped"],
+            "supported_template_modes": ["builtin", "mapped"],
             "supported_export_formats": ["docx", "pdf", "json_bundle"],
         }
 
@@ -470,7 +470,6 @@ class CapabilityRegistry:
             "ApprovalRequest": ApprovalRequest,
             "ReviewIssue": ReviewIssue,
             "RenderManifest": RenderManifest,
-            "DocumentIR": DocumentIR,
         }
         compact_tools = [
             "get_capabilities",

@@ -9,7 +9,10 @@ from daf.document_engine.docx_builder import (
     DocumentEngine,
     compute_render_input_fingerprint,
 )
-from daf.document_engine.ir import build_document_ir, parse_section_to_ir
+from daf.document_engine.pandoc_renderer import (
+    render_document_single_pass_pandoc,
+    render_mapped_sections_single_pass_pandoc,
+)
 
 __all__ = [
     "DocumentEngine",
@@ -18,7 +21,7 @@ __all__ = [
     "RENDERER_VERSION",
     "RenderStaleError",
     "TemplateRenderError",
-    "build_document_ir",
     "compute_render_input_fingerprint",
-    "parse_section_to_ir",
+    "render_document_single_pass_pandoc",
+    "render_mapped_sections_single_pass_pandoc",
 ]
