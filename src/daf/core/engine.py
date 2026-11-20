@@ -7,7 +7,7 @@ import json
 import os
 import sqlite3
 import uuid
-from datetime import UTC, datetime, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -55,6 +55,23 @@ from daf.workflow_engine.state_machine import (
 
 def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _pid_is_alive(pid: int | None) -> bool:
+    """Return True if a local OS process with the given PID appears to be alive."""
+    if pid is None or pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
 
 
 class DAFEngine:
@@ -338,6 +355,7 @@ class DAFEngine:
         evidence_items: list[dict[str, Any]],
         *,
         allow_source_replacement: bool = False,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         def _mutator(
             state: ProjectWorkspaceState, _conn: sqlite3.Connection
@@ -373,7 +391,13 @@ class DAFEngine:
                 "invalidated_sections": reg_out["invalidated_sections"],
             }
 
-        return self.store.transact_project(project_id, "register_evidence", _mutator)
+        return self.store.transact_project(
+            project_id,
+            "register_evidence",
+            _mutator,
+            idempotency_key=idempotency_key,
+            request_payload={"project_id": project_id, "evidence_items": evidence_items},
+        )
 
     # 4c. list_source_blocks (R3-04 §1.2A)
     def list_source_blocks(
@@ -453,6 +477,7 @@ class DAFEngine:
         nodes: list[dict[str, Any]],
         terminology: dict[str, str] | None = None,
         symbol_table: dict[str, str] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         def _mutator(
             state: ProjectWorkspaceState, _conn: sqlite3.Connection
@@ -467,7 +492,20 @@ class DAFEngine:
             summary = f"Submitted outline revision {res['outline_revision']} ({res['section_count']} sections)."
             return res, summary, res
 
-        return self.store.transact_project(project_id, "submit_outline", _mutator)
+        return self.store.transact_project(
+            project_id,
+            "submit_outline",
+            _mutator,
+            idempotency_key=idempotency_key,
+            request_payload={
+                "project_id": project_id,
+                "global_thesis": global_thesis,
+                "nodes": nodes,
+                "terminology": terminology,
+                "symbol_table": symbol_table,
+            },
+            hydrate_slices=False,
+        )
 
     # 7. get_section_context (R3-03 & R3-05)
     def get_section_context(
@@ -608,6 +646,7 @@ class DAFEngine:
         claim_evaluations: list[dict[str, Any]] | None = None,
         checklist_results: list[dict[str, Any]] | None = None,
         checklist_hash: str | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Submit a structured semantic review report; valid approving reports are accepted immediately."""
         effective_reviewer = reviewed_by or reviewer_agent
@@ -633,7 +672,21 @@ class DAFEngine:
             return res, summary, res
 
         try:
-            return self.store.transact_project(project_id, "submit_semantic_review", _mutator)
+            return self.store.transact_project(
+                project_id,
+                "submit_semantic_review",
+                _mutator,
+                idempotency_key=idempotency_key,
+                request_payload={
+                    "project_id": project_id,
+                    "task_id": task_id,
+                    "section_revision": section_revision,
+                    "context_fingerprint": context_fingerprint,
+                    "recommendation": recommendation,
+                    "checklist_hash": checklist_hash,
+                },
+                hydrate_slices=False,
+            )
         except ContractValidationError as exc:
             if exc.code == "CLAIM_SUPPORT_CONFLICT":
                 self.store.record_audit_event(
@@ -808,7 +861,7 @@ class DAFEngine:
             detail["last_rendered_docx_path"] = state.last_rendered_docx_path
         return detail
 
-    # 12a. request_approval (R2-P0-01 non-privileged Agent approval request — NEVER returns confirmation_token)
+    # 12a. request_approval (idempotent & deduplicated by artifact_hash)
     def request_approval(
         self,
         project_id: str,
@@ -817,12 +870,13 @@ class DAFEngine:
         ttl_seconds: int = 3600,
         requested_by: str = "agent",
         channel: str | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         _ = requested_by
         if channel is not None:
             raise UntrustedApprovalChannelError(
                 f"Agent tool 'request_approval' forbids specifying approval channel '{channel}'. "
-                "Human confirmation must occur in the trusted confirmation domain.",
+                "Human confirmation must occur in local UI or CLI.",
                 details={"attempted_channel": channel},
             )
 
@@ -836,14 +890,26 @@ class DAFEngine:
                 ttl_seconds=ttl_seconds,
             )
             summary = (
-                f"Created pending ApprovalRequest '{res['approval_request_id']}' for {artifact_type} "
+                f"Created/reused pending ApprovalRequest '{res['approval_request_id']}' for {artifact_type} "
                 f"(target={res['target_id']}, rev={res['artifact_revision']})."
             )
             return res, summary, res
 
-        return self.store.transact_project(project_id, "request_approval", _mutator)
+        return self.store.transact_project(
+            project_id,
+            "request_approval",
+            _mutator,
+            idempotency_key=idempotency_key,
+            request_payload={
+                "project_id": project_id,
+                "artifact_type": artifact_type,
+                "target_id": target_id,
+                "ttl_seconds": ttl_seconds,
+            },
+            hydrate_slices=False,
+        )
 
-    # 12b. get_approval_status (R2-P0-01 non-privileged Agent approval status query)
+    # 12b. get_approval_status (strictly read-only — never mutates state_version or writes audit)
     def get_approval_status(
         self,
         project_id: str,
@@ -851,18 +917,13 @@ class DAFEngine:
         artifact_type: Literal["outline", "section", "final_draft"] | None = None,
         target_id: str = "global",
     ) -> dict[str, Any]:
-        def _mutator(
-            state: ProjectWorkspaceState, _conn: sqlite3.Connection
-        ) -> tuple[dict[str, Any], str, dict[str, Any]]:
-            res = WorkflowEngine.get_approval_status(
-                state=state,
-                approval_request_id=approval_request_id,
-                artifact_type=artifact_type,
-                target_id=target_id,
-            )
-            return res, f"Queried approval status for '{approval_request_id or f'{artifact_type}:{target_id}'}'.", res
-
-        return self.store.transact_project(project_id, "get_approval_status", _mutator)
+        state = self.store.load_state(project_id, hydrate_slices=False, hydrate_sections=False)
+        return WorkflowEngine.get_approval_status(
+            state=state,
+            approval_request_id=approval_request_id,
+            artifact_type=artifact_type,
+            target_id=target_id,
+        )
 
     def decide_approval_by_human(
         self,
@@ -896,27 +957,38 @@ class DAFEngine:
 
         return self.store.transact_project(project_id, "decide_approval_by_human", _mutator)
 
-    # 13. get_project_status
+    # 13. get_project_status (strictly read-only; never mutates state or reaps active render jobs)
     def get_project_status(self, project_id: str) -> dict[str, Any]:
-        self.recover_render_jobs(project_id)
-        state = self.store.load_state(project_id)
+        from daf.guidance.state_resolver import resolve_task_state
+
+        state = self.store.load_state(project_id, hydrate_slices=False)
         ReviewManager.refresh_semantic_task_staleness(state)
-        required_ids = [s.section_id for s in state.profile.structure_profile.required_sections]
-        sections_status: list[dict[str, Any]] = []
+        rules_by_id = {
+            r.section_id: r
+            for r in (
+                state.profile.structure_profile.required_sections
+                + state.profile.structure_profile.optional_sections
+            )
+        }
         node_map = {n.section_id: n for n in state.outline_graph.nodes}
-        for req in (
-            state.profile.structure_profile.required_sections
-            + state.profile.structure_profile.optional_sections
-        ):
-            sec = state.section_versions.sections.get(req.section_id)
-            sec_app = state.approvals.get(f"section:{req.section_id}")
-            node = node_map.get(req.section_id)
+        # P1-2: Outline nodes are the canonical section list once planned; fall back to profile rules before outline
+        ordered_ids = (
+            [n.section_id for n in state.outline_graph.nodes]
+            if state.outline_graph.nodes
+            else list(rules_by_id.keys())
+        )
+        sections_status: list[dict[str, Any]] = []
+        for sid in ordered_ids:
+            req = rules_by_id.get(sid)
+            sec = state.section_versions.sections.get(sid)
+            sec_app = state.approvals.get(f"section:{sid}")
+            node = node_map.get(sid)
             _, _, w_meta = resolve_section_word_budget(req, node, state.outline_graph)
             sections_status.append(
                 {
-                    "section_id": req.section_id,
-                    "title": sec.title if sec else req.title,
-                    "required": req.required,
+                    "section_id": sid,
+                    "title": sec.title if sec else (node.title if node else (req.title if req else sid)),
+                    "required": req.required if req else True,
                     "revision": sec.revision if sec else 0,
                     "content_hash": sec.content_hash if sec else "",
                     "is_preapproval_draft": sec.is_preapproval_draft if sec else False,
@@ -928,54 +1000,36 @@ class DAFEngine:
             )
 
         open_issues = [i for i in state.review_ledger.issues if i.status == "open"]
-        undrafted_required = [
-            sid
-            for sid in required_ids
-            if sid not in state.section_versions.sections
-            or state.section_versions.sections[sid].revision == 0
-        ]
-        stale_sections = [
-            s.section_id
-            for s in state.section_versions.sections.values()
-            if s.revision > 0 and s.needs_revalidation
-        ]
-        pending_sem_tasks = [
-            t.task_id
-            for t in state.review_ledger.semantic_review_tasks
-            if t.status in {"pending", "claimed", "stale", "rejected"}
+        active_render_jobs = [
+            j.model_dump(mode="json")
+            for j in state.render_jobs.values()
+            if j.phase in {"prepared", "built", "promoted"}
         ]
 
-        next_actions: list[str] = []
+        # P1-2: Single source of truth for next_action via state_resolver
         if not state.source_registry.documents:
-            next_actions.append("Call ingest_sources and register_evidence to populate EvidenceLedger.")
-        elif state.outline_graph.outline_revision == 0:
-            next_actions.append("Call get_project_context and submit_outline to establish the document structure.")
-        elif state.approvals.get("outline") is None or state.approvals["outline"].status != "approved":
-            next_actions.append(
-                "Call request_approval(artifact_type='outline') and ask the human user to confirm it in the trusted portal."
-            )
-        elif undrafted_required:
-            next_actions.append(
-                f"Draft remaining required sections via get_section_context + submit_section: {undrafted_required}."
-            )
-        elif stale_sections:
-            next_actions.append(
-                f"Revalidate and update downstream sections affected by upstream or evidence changes: {stale_sections}."
-            )
-        elif open_issues:
-            next_actions.append(
-                f"Resolve {len(open_issues)} open review issues via get_revision_tasks + submit_section."
-            )
-        elif pending_sem_tasks or not state.review_ledger.semantic_review_tasks:
-            next_actions.append(
-                "Run review_document, then complete semantic reviews via submit_semantic_review + accept_semantic_review."
-            )
-        elif state.approvals.get("final_draft") is None or state.approvals["final_draft"].status != "approved":
-            next_actions.append(
-                "Call request_approval(artifact_type='final_draft') and wait for the human user to approve in the trusted portal."
-            )
+            resolution = resolve_task_state(state, "source_analysis", None)
+        elif state.outline_graph.outline_revision == 0 or (
+            state.approvals.get("outline") is None or state.approvals["outline"].status != "approved"
+        ):
+            resolution = resolve_task_state(state, "plan_outline", None)
         else:
-            next_actions.append("Call render_document(purpose='release') and export_document(purpose='release').")
+            undrafted = next(
+                (
+                    sid
+                    for sid in ordered_ids
+                    if sid not in state.section_versions.sections
+                    or state.section_versions.sections[sid].revision == 0
+                ),
+                None,
+            )
+            if undrafted is not None:
+                resolution = resolve_task_state(state, "draft_section", undrafted)
+            else:
+                resolution = resolve_task_state(state, "release_preflight", None)
+
+        next_action = resolution.next_action
+        next_actions = [f"{next_action.get('tool') or 'done'}: {next_action.get('reason', '')}".strip()]
 
         return {
             "project_id": state.brief.project_id,
@@ -1000,6 +1054,7 @@ class DAFEngine:
             "approval_requests": {k: v.model_dump(mode="json") for k, v in state.approval_requests.items()},
             "approvals": {k: v.model_dump(mode="json") for k, v in state.approvals.items()},
             "open_issue_count": len(open_issues),
+            "active_render_jobs": active_render_jobs,
             "active_user_constraints": list(state.decision_log.active_user_constraints),
             "forbidden_modification_scopes": list(state.decision_log.forbidden_modification_scopes),
             "last_render_manifest": (
@@ -1009,19 +1064,31 @@ class DAFEngine:
             ),
             "last_rendered_docx_path": state.last_rendered_docx_path,
             "last_exported_pdf_path": state.last_exported_pdf_path,
+            "next_action": next_action,
             "recommended_next_actions": next_actions,
         }
 
-    # 14a. recover_render_jobs (R2-P1-05 §5.3 Step 6)
+    # 14a. recover_render_jobs (P1-4: lease- & PID-aware crash recovery only)
     def recover_render_jobs(self, project_id: str) -> dict[str, Any]:
-        """Inspect and recover/clean up any incomplete RenderJobs ('prepared', 'built', 'promoted') that crashed before DB finalize."""
-        state_peek = self.store.load_state(project_id)
-        incomplete_ids = [
-            jid
-            for jid, j in state_peek.render_jobs.items()
-            if j.phase in {"prepared", "built", "promoted"}
-        ]
-        if not incomplete_ids:
+        """Recover only incomplete RenderJobs whose lease has expired AND whose owner PID is no longer alive."""
+        now = datetime.now(timezone.utc)
+        state_peek = self.store.load_state(project_id, hydrate_slices=False, hydrate_sections=False)
+
+        def _is_reapable(job: RenderJob) -> bool:
+            if job.phase not in {"prepared", "built", "promoted"}:
+                return False
+            if job.lease_until:
+                try:
+                    if datetime.fromisoformat(job.lease_until) > now:
+                        return False
+                except ValueError:
+                    pass
+            if _pid_is_alive(job.owner_pid):
+                return False
+            return True
+
+        reapable_ids = [jid for jid, j in state_peek.render_jobs.items() if _is_reapable(j)]
+        if not reapable_ids:
             return {"project_id": project_id, "recovered_jobs": []}
 
         def _mutator(
@@ -1037,7 +1104,7 @@ class DAFEngine:
             recovered: list[str] = []
             now_iso = datetime.now(timezone.utc).isoformat()
             for jid, job in state.render_jobs.items():
-                if job.phase in {"prepared", "built", "promoted"}:
+                if _is_reapable(job):
                     if job.temp_path:
                         tp = Path(job.temp_path)
                         if tp.exists():
@@ -1054,13 +1121,15 @@ class DAFEngine:
                                 pass
                     job.phase = "aborted_recovered"
                     job.updated_at = now_iso
-                    job.error_message = "Recovered incomplete render job that did not complete DB finalize."
+                    job.error_message = "Recovered expired render job whose owner process exited."
                     recovered.append(jid)
 
             res = {"project_id": project_id, "recovered_jobs": recovered}
-            return res, f"Recovered {len(recovered)} incomplete render jobs.", res
+            return res, f"Recovered {len(recovered)} expired render jobs.", res
 
-        return self.store.transact_project(project_id, "recover_render_jobs", _mutator)
+        return self.store.transact_project(
+            project_id, "recover_render_jobs", _mutator, hydrate_slices=False, hydrate_sections=False
+        )
 
     # 14. render_document (R2-P1-05 two-phase Prepare -> Build (out-of-tx) -> Revalidate & Finalize)
     def render_document(
@@ -1122,6 +1191,7 @@ class DAFEngine:
                     f"Output path '{target_path}' escapes project artifacts directory."
                 ) from exc
 
+            now_utc = datetime.now(timezone.utc)
             job = RenderJob(
                 job_id=job_id,
                 render_id=render_id,
@@ -1130,6 +1200,9 @@ class DAFEngine:
                 phase="prepared",
                 input_fingerprint=fp_info["input_fingerprint"],
                 target_path=str(target_path),
+                owner_pid=os.getpid(),
+                heartbeat_at=now_utc.isoformat(),
+                lease_until=(now_utc + timedelta(minutes=10)).isoformat(),
             )
             state.render_jobs[job_id] = job
             prepared_holder["state_snapshot"] = state.model_copy(deep=True)

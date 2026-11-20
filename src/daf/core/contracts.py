@@ -149,8 +149,8 @@ class SourceBlockSlice(StrictContractModel):
     slice_id: str
     source_id: str
     locator: str
-    raw_text: str
-    normalized_text: str
+    raw_text: str = ""
+    normalized_text: str = ""
     char_count: int
     sha256: str
 
@@ -793,6 +793,9 @@ class RenderJob(StrictContractModel):
     temp_path: str = ""
     target_path: str = ""
     output_sha256: str = ""
+    owner_pid: int | None = None
+    heartbeat_at: str = Field(default_factory=utc_now_iso)
+    lease_until: str = ""
     created_at: str = Field(default_factory=utc_now_iso)
     updated_at: str = Field(default_factory=utc_now_iso)
     error_message: str = ""

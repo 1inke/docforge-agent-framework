@@ -109,6 +109,9 @@ def run_cli_args(argv: list[str] | None = None) -> dict[str, Any]:
     p_con_add.add_argument("--forbidden-scope", action="append", default=[])
     p_con_add.add_argument("--ack-template-conflict", action="append", default=[])
 
+    p_snap = subparsers.add_parser("export-snapshot", help="Export a human-readable JSON snapshot of a project on demand.")
+    p_snap.add_argument("--project-id", required=True)
+
     # Generic Agent tool dispatcher
     p_call = subparsers.add_parser("call", help="Invoke any non-privileged DAFEngine Agent tool with a JSON payload.")
     p_call.add_argument("tool_name", type=str)
@@ -170,6 +173,9 @@ def run_cli_args(argv: list[str] | None = None) -> dict[str, Any]:
             add_forbidden_scopes=args.forbidden_scope,
             acknowledge_template_conflicts=args.ack_template_conflict,
         )
+    if args.command == "export-snapshot":
+        snap_path = engine.store.export_snapshot(args.project_id)
+        return {"project_id": args.project_id, "snapshot_path": str(snap_path)}
     if args.command == "call":
         kwargs = _load_json_arg(args.params)
         if not isinstance(kwargs, dict):

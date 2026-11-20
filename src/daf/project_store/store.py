@@ -1,13 +1,12 @@
-"""Project Workspace & SQLite Atomic CAS State Store for DocForge Agent Framework (DAF §3.2, §7.2, §9, DAF-P0-03 & R2)."""
+"""Project Workspace & SQLite Atomic CAS State Store (split-table blob model, P1-1 & P1-4)."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import hashlib
-import hmac
 import json
-import os
 from pathlib import Path
 import re
 import secrets
@@ -20,13 +19,17 @@ from daf.core.errors import (
     ArtifactPathInvalidError,
     IdempotencyKeyConflictError,
     ProjectAlreadyExistsError,
+    ProjectNotFoundError,
     RevisionConflictError,
     SecurityBoundaryError,
     UntrustedApprovalChannelError,
 )
 
 SAFE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-.]{0,127}$")
-SAFE_DOCX_FILENAME_PATTERN = re.compile(r"^[A-Za-z0-9_\-\u4e00-\u9fff][A-Za-z0-9_\-. \u4e00-\u9fff]{0,120}\.docx$", re.IGNORECASE)
+SAFE_DOCX_FILENAME_PATTERN = re.compile(
+    r"^[A-Za-z0-9_\-\u4e00-\u9fff][A-Za-z0-9_\-. \u4e00-\u9fff]{0,120}\.docx$",
+    re.IGNORECASE,
+)
 WINDOWS_RESERVED_NAMES = {
     "CON",
     "PRN",
@@ -45,10 +48,11 @@ WORKSPACE_SUBDIRS: tuple[str, ...] = (
     "reviews",
     "decisions",
     "artifacts",
+    "figures",
     "logs",
 )
 
-DB_SCHEMA_VERSION = 3
+DB_SCHEMA_VERSION = 4
 
 
 def validate_safe_identifier(value: str, field_name: str = "identifier") -> str:
@@ -67,7 +71,7 @@ def validate_safe_identifier(value: str, field_name: str = "identifier") -> str:
 
 
 def validate_safe_docx_filename(filename: str) -> str:
-    """Validate that `output_filename` is a single safe `.docx` filename with no traversal or reserved names (R2-P1-05)."""
+    """Validate that `output_filename` is a single safe `.docx` filename with no traversal or reserved names."""
     if not filename or not isinstance(filename, str):
         raise ArtifactPathInvalidError(
             "Invalid empty output_filename.",
@@ -114,34 +118,45 @@ def compute_canonical_request_hash(payload: Any) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 class ProjectStore:
-    """Manages project workspace directories, SQLite atomic CAS transactions, idempotency, and derived JSON snapshots."""
+    """SQLite authoritative state store with content-addressed immutable blobs and CAS transactions."""
 
     def __init__(self, workspace_root: str | Path) -> None:
         raw_root = Path(workspace_root)
         if raw_root.exists() and raw_root.is_symlink():
             raise SecurityBoundaryError(
-                f"Security violation: workspace_root '{raw_root}' cannot be a symbolic link."
+                f"Security violation: workspace_root '{raw_root}' must not be a symlink."
             )
         self.workspace_root = raw_root.resolve()
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self.db_path = self.workspace_root / "daf_workspace.sqlite3"
-        self._init_and_migrate_db()
+        self._blob_cache: dict[str, str] = {}
+        self._init_db()
 
-    def _connect(self, autocommit: bool = False) -> sqlite3.Connection:
-        conn = sqlite3.connect(
-            str(self.db_path),
-            timeout=30.0,
-            isolation_level=None if autocommit else "DEFERRED",
-        )
+    def _connect(self, autocommit: bool = False, readonly: bool = False) -> sqlite3.Connection:
+        if readonly and self.db_path.exists():
+            uri = f"{self.db_path.as_uri()}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=30.0)
+            conn.row_factory = sqlite3.Row
+            return conn
+        isolation = None if autocommit else ""
+        conn = sqlite3.connect(str(self.db_path), timeout=30.0, isolation_level=isolation)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout = 30000")
-        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("PRAGMA busy_timeout=15000;")
         return conn
 
-    def _init_and_migrate_db(self) -> None:
+    def _init_db(self) -> None:
         conn = self._connect(autocommit=True)
         try:
+            ver = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if ver >= DB_SCHEMA_VERSION:
+                return
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
@@ -156,11 +171,46 @@ class ProjectStore:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS blobs (
+                    sha256 TEXT PRIMARY KEY,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS source_slices (
+                    project_id TEXT NOT NULL,
+                    slice_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    locator TEXT NOT NULL,
+                    char_count INTEGER NOT NULL,
+                    blob_sha256 TEXT NOT NULL,
+                    PRIMARY KEY (project_id, slice_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS section_revisions (
+                    project_id TEXT NOT NULL,
+                    section_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    blob_sha256 TEXT NOT NULL,
+                    author_session TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (project_id, section_id, revision)
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS idempotency_records (
                     project_id TEXT NOT NULL,
                     idempotency_key TEXT NOT NULL,
                     tool_name TEXT NOT NULL,
-                    request_hash TEXT NOT NULL DEFAULT '',
+                    request_hash TEXT NOT NULL,
                     result_state_version INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     response_json TEXT NOT NULL,
@@ -180,167 +230,209 @@ class ProjectStore:
                 )
                 """
             )
-
-            # Check columns for migration from v1/v2 databases
-            proj_cols = {
-                r["name"] for r in conn.execute("PRAGMA table_info(projects)").fetchall()
-            }
-            if "state_version" not in proj_cols:
-                conn.execute(
-                    "ALTER TABLE projects ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0"
-                )
-
-            idem_cols = {
-                r["name"] for r in conn.execute("PRAGMA table_info(idempotency_records)").fetchall()
-            }
-            if "request_hash" not in idem_cols:
-                conn.execute(
-                    "ALTER TABLE idempotency_records ADD COLUMN request_hash TEXT NOT NULL DEFAULT ''"
-                )
-            if "result_state_version" not in idem_cols:
-                conn.execute(
-                    "ALTER TABLE idempotency_records ADD COLUMN result_state_version INTEGER NOT NULL DEFAULT 0"
-                )
-
             conn.execute(f"PRAGMA user_version = {DB_SCHEMA_VERSION}")
             conn.execute("COMMIT")
         except Exception:
-            conn.execute("ROLLBACK")
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
             raise
         finally:
             conn.close()
 
     def get_project_dir(self, project_id: str) -> Path:
-        validate_safe_identifier(project_id, "project_id")
-        projects_parent = self.workspace_root / "projects"
-        if projects_parent.exists() and projects_parent.is_symlink():
-            raise SecurityBoundaryError(
-                f"Security violation: projects directory '{projects_parent}' is a symbolic link."
-            )
-        raw_project_dir = projects_parent / project_id
-        if raw_project_dir.exists() and raw_project_dir.is_symlink():
-            raise SecurityBoundaryError(
-                f"Security violation: project directory '{raw_project_dir}' is a symbolic link."
-            )
-        project_dir = raw_project_dir.resolve()
+        safe_id = validate_safe_identifier(project_id, "project_id")
+        candidate = (self.workspace_root / "projects" / safe_id).resolve()
         try:
-            project_dir.relative_to(self.workspace_root)
+            candidate.relative_to(self.workspace_root)
         except ValueError as exc:
             raise SecurityBoundaryError(
-                f"Security violation: project path '{project_dir}' escapes workspace root '{self.workspace_root}'."
+                f"Security violation: project path '{candidate}' escapes workspace '{self.workspace_root}'."
             ) from exc
-        return project_dir
-
-    def project_dir(self, project_id: str) -> Path:
-        return self.get_project_dir(project_id)
+        return candidate
 
     def ensure_project_dirs(self, project_id: str) -> Path:
         project_dir = self.get_project_dir(project_id)
         project_dir.mkdir(parents=True, exist_ok=True)
         for sub in WORKSPACE_SUBDIRS:
             sub_dir = project_dir / sub
-            if sub_dir.exists() and sub_dir.is_symlink():
-                err_cls = ArtifactPathInvalidError if sub == "artifacts" else SecurityBoundaryError
-                raise err_cls(
-                    f"Security violation: workspace subdirectory '{sub_dir}' is a symbolic link."
+            if sub == "artifacts" and sub_dir.exists() and sub_dir.is_symlink():
+                raise ArtifactPathInvalidError(
+                    f"Security violation: artifacts directory '{sub_dir}' must not be a symlink."
                 )
             sub_dir.mkdir(parents=True, exist_ok=True)
-            resolved_sub = sub_dir.resolve()
-            try:
-                resolved_sub.relative_to(project_dir)
-            except ValueError as exc:
-                err_cls = ArtifactPathInvalidError if sub == "artifacts" else SecurityBoundaryError
-                raise err_cls(
-                    f"Security violation: subdirectory '{resolved_sub}' escapes project directory '{project_dir}'."
-                ) from exc
         return project_dir
 
-    def sync_derived_snapshots(self, state: ProjectWorkspaceState) -> None:
-        """Write derived human-readable JSON files AFTER SQLite transaction commits.
-        SQLite remains the sole authoritative state source (DAF-P0-03 §3.4).
-        No secret approval tokens are ever written to disk (R2-P0-01 §1.3C).
-        """
-        project_id = validate_safe_identifier(state.brief.project_id, "project_id")
-        project_dir = self.ensure_project_dirs(project_id)
+    # =========================================================================
+    # Content-Addressed Blob Extraction & Hydration (P1-1)
+    # =========================================================================
+
+    def _put_blob_in_tx(self, conn: sqlite3.Connection, sha: str, content: str, now_iso: str) -> None:
+        if sha in self._blob_cache:
+            return
+        conn.execute(
+            "INSERT OR IGNORE INTO blobs (sha256, content, created_at) VALUES (?, ?, ?)",
+            (sha, content, now_iso),
+        )
+        self._blob_cache[sha] = content
+
+    def _compact_state_and_store_blobs(
+        self,
+        state: ProjectWorkspaceState,
+        conn: sqlite3.Connection,
+        now_iso: str,
+    ) -> str:
+        """Store immutable slice/section text blobs separately and return compact metadata-only JSON."""
+        project_id = state.brief.project_id
         state_dict = state.model_dump(mode="json")
-        state_json = json.dumps(state_dict, ensure_ascii=False, indent=2)
 
-        try:
-            (project_dir / "state_snapshot.json").write_text(state_json, encoding="utf-8")
-            (project_dir / "profiles" / "document_profile.json").write_text(
-                json.dumps(state.profile.model_dump(mode="json"), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            (project_dir / "sources" / "source_registry.json").write_text(
-                json.dumps(state.source_registry.model_dump(mode="json"), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            (project_dir / "evidence" / "evidence_ledger.json").write_text(
-                json.dumps(state.evidence_ledger.model_dump(mode="json"), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            (project_dir / "outline" / "outline_graph.json").write_text(
-                json.dumps(state.outline_graph.model_dump(mode="json"), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            (project_dir / "decisions" / "decision_log.json").write_text(
-                json.dumps(state.decision_log.model_dump(mode="json"), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            (project_dir / "decisions" / "approval_requests.json").write_text(
-                json.dumps(
-                    {k: v.model_dump(mode="json") for k, v in state.approval_requests.items()},
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-            (project_dir / "reviews" / "review_ledger.json").write_text(
-                json.dumps(state.review_ledger.model_dump(mode="json"), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            if state.last_render_manifest is not None:
-                (project_dir / "artifacts" / "render_manifest.json").write_text(
-                    json.dumps(state.last_render_manifest.model_dump(mode="json"), ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-            for sec_id, sec_state in state.section_versions.sections.items():
-                safe_sec_id = validate_safe_identifier(sec_id, "section_id")
-                (project_dir / "sections" / f"{safe_sec_id}.json").write_text(
-                    json.dumps(sec_state.model_dump(mode="json"), ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-
-            # Sync audit_events.jsonl from authoritative SQLite table
-            events = self.get_audit_events(project_id)
-            audit_jsonl = project_dir / "logs" / "audit_events.jsonl"
-            lines = [json.dumps(ev, ensure_ascii=False) for ev in events]
-            audit_jsonl.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-        except Exception as exc:
-            repair_marker = project_dir / "logs" / "snapshot_sync_pending.json"
-            try:
-                repair_marker.write_text(
-                    json.dumps(
-                        {
-                            "project_id": project_id,
-                            "state_version": state.state_version,
-                            "error": str(exc),
-                        },
-                        ensure_ascii=False,
+        # 1. Offload source slices
+        slices_dict = state_dict.get("source_registry", {}).get("slices", {})
+        for slice_id, sl in slices_dict.items():
+            raw_text = sl.get("raw_text") or ""
+            sha = sl.get("sha256") or _sha256_text(raw_text)
+            sl["sha256"] = sha
+            if raw_text:
+                self._put_blob_in_tx(conn, sha, raw_text, now_iso)
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO source_slices
+                    (project_id, slice_id, source_id, locator, char_count, blob_sha256)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        project_id,
+                        slice_id,
+                        sl.get("source_id", ""),
+                        sl.get("locator", ""),
+                        int(sl.get("char_count", len(raw_text))),
+                        sha,
                     ),
-                    encoding="utf-8",
                 )
-            except Exception:
-                pass
+            sl["raw_text"] = ""
+            sl["normalized_text"] = ""
 
-    def repair_derived_snapshots(self, project_id: str) -> ProjectWorkspaceState:
-        """Rebuild all derived disk JSON snapshots from the authoritative SQLite record (T-TXN-05)."""
+        # 2. Offload section current & historical markdown
+        sections_dict = state_dict.get("section_versions", {}).get("sections", {})
+        for sec_id, sec in sections_dict.items():
+            cur_md = sec.get("content_markdown") or ""
+            if cur_md:
+                chash = sec.get("content_hash") or _sha256_text(cur_md)
+                sec["content_hash"] = chash
+                self._put_blob_in_tx(conn, chash, cur_md, now_iso)
+            sec["content_markdown"] = ""
+
+            for hist in sec.get("history") or []:
+                h_md = hist.get("content_markdown") or ""
+                h_hash = hist.get("content_hash") or (_sha256_text(h_md) if h_md else "")
+                if h_md and h_hash:
+                    hist["content_hash"] = h_hash
+                    self._put_blob_in_tx(conn, h_hash, h_md, now_iso)
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO section_revisions
+                        (project_id, section_id, revision, blob_sha256, author_session, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            project_id,
+                            sec_id,
+                            int(hist.get("revision", 0)),
+                            h_hash,
+                            hist.get("author_session", ""),
+                            hist.get("created_at", now_iso),
+                        ),
+                    )
+                hist["content_markdown"] = ""
+
+        return json.dumps(state_dict, ensure_ascii=False, separators=(",", ":"))
+
+    def _fetch_blobs(self, conn: sqlite3.Connection, shas: set[str]) -> dict[str, str]:
+        result: dict[str, str] = {}
+        missing: list[str] = []
+        for sha in shas:
+            if not sha:
+                continue
+            cached = self._blob_cache.get(sha)
+            if cached is not None:
+                result[sha] = cached
+            else:
+                missing.append(sha)
+        if missing:
+            # SQLite parameter limit safety: fetch in chunks of 500
+            for i in range(0, len(missing), 500):
+                chunk = missing[i : i + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"SELECT sha256, content FROM blobs WHERE sha256 IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                for r in rows:
+                    s_val = str(r["sha256"])
+                    c_val = str(r["content"])
+                    self._blob_cache[s_val] = c_val
+                    result[s_val] = c_val
+        return result
+
+    def _hydrate_state_dict(
+        self,
+        state_dict: dict[str, Any],
+        conn: sqlite3.Connection,
+        *,
+        hydrate_slices: bool = True,
+        hydrate_sections: bool = True,
+    ) -> ProjectWorkspaceState:
+        needed: set[str] = set()
+        slices_dict = state_dict.get("source_registry", {}).get("slices", {})
+        sections_dict = state_dict.get("section_versions", {}).get("sections", {})
+
+        if hydrate_slices:
+            for sl in slices_dict.values():
+                if not sl.get("raw_text") and sl.get("sha256"):
+                    needed.add(sl["sha256"])
+        if hydrate_sections:
+            for sec in sections_dict.values():
+                if not sec.get("content_markdown") and sec.get("content_hash"):
+                    needed.add(sec["content_hash"])
+                for hist in sec.get("history") or []:
+                    if not hist.get("content_markdown") and hist.get("content_hash"):
+                        needed.add(hist["content_hash"])
+
+        blobs = self._fetch_blobs(conn, needed) if needed else {}
+
+        if hydrate_slices:
+            for sl in slices_dict.values():
+                if not sl.get("raw_text") and sl.get("sha256") in blobs:
+                    sl["raw_text"] = blobs[sl["sha256"]]
+        if hydrate_sections:
+            for sec in sections_dict.values():
+                if not sec.get("content_markdown") and sec.get("content_hash") in blobs:
+                    sec["content_markdown"] = blobs[sec["content_hash"]]
+                for hist in sec.get("history") or []:
+                    if not hist.get("content_markdown") and hist.get("content_hash") in blobs:
+                        hist["content_markdown"] = blobs[hist["content_hash"]]
+
+        return ProjectWorkspaceState.model_validate(state_dict)
+
+    # =========================================================================
+    # On-Demand Snapshot Export (replaces automatic per-write snapshot rewrite)
+    # =========================================================================
+
+    def export_snapshot(self, project_id: str) -> Path:
+        """Export a human-readable JSON snapshot of the project on demand (CLI: daf export-snapshot)."""
         state = self.load_state(project_id)
-        self.sync_derived_snapshots(state)
-        repair_marker = self.get_project_dir(project_id) / "logs" / "snapshot_sync_pending.json"
-        if repair_marker.exists():
-            repair_marker.unlink()
-        return state
+        project_dir = self.ensure_project_dirs(project_id)
+        snap_path = project_dir / "state_snapshot.json"
+        snap_path.write_text(
+            json.dumps(state.model_dump(mode="json"), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return snap_path
+
+    # =========================================================================
+    # Atomic Transactions & Read-Only Queries
+    # =========================================================================
 
     def create_initial_state(
         self,
@@ -348,14 +440,11 @@ class ProjectStore:
         audit_summary: str,
         audit_payload: dict[str, Any] | None = None,
     ) -> ProjectWorkspaceState:
-        """Create a new project using strict create-only semantics (R2-P1-04).
-        Raises ProjectAlreadyExistsError (`PROJECT_ALREADY_EXISTS`) if `project_id` already exists.
-        """
+        """Create a new project using strict create-only semantics."""
         project_id = validate_safe_identifier(state.brief.project_id, "project_id")
         now_iso = datetime.now(timezone.utc).isoformat()
         state.updated_at = now_iso
         state.state_version = 1
-        state_json = json.dumps(state.model_dump(mode="json"), ensure_ascii=False, indent=2)
 
         conn = self._connect(autocommit=True)
         try:
@@ -374,12 +463,13 @@ class ProjectStore:
                         "existing_state_version": int(existing["state_version"]),
                     },
                 )
+            compact_json = self._compact_state_and_store_blobs(state, conn, now_iso)
             conn.execute(
                 """
                 INSERT INTO projects (project_id, stage, updated_at, state_version, state_json)
                 VALUES (?, ?, ?, 1, ?)
                 """,
-                (project_id, state.stage, now_iso, state_json),
+                (project_id, state.stage, now_iso, compact_json),
             )
             conn.execute(
                 """
@@ -413,7 +503,6 @@ class ProjectStore:
         finally:
             conn.close()
 
-        self.sync_derived_snapshots(state)
         return state
 
     def transact_project(
@@ -425,17 +514,24 @@ class ProjectStore:
         idempotency_key: str | None = None,
         request_payload: Any | None = None,
         simulate_mid_transaction_crash: bool = False,
+        hydrate_slices: bool = True,
+        hydrate_sections: bool = True,
     ) -> dict[str, Any]:
         """Execute a read-validate-mutate-persist-audit cycle inside a single SQLite BEGIN IMMEDIATE transaction with CAS."""
         validate_safe_identifier(project_id, "project_id")
-        req_hash = compute_canonical_request_hash(request_payload) if request_payload is not None else ""
+        req_hash = (
+            compute_canonical_request_hash(
+                request_payload if request_payload is not None else {"tool": tool_name, "project_id": project_id}
+            )
+            if idempotency_key
+            else ""
+        )
 
         conn = self._connect(autocommit=True)
-        committed_state: ProjectWorkspaceState | None = None
         try:
             conn.execute("BEGIN IMMEDIATE")
 
-            # 1. Check idempotency key inside the serialized transaction
+            # 1. Check idempotency key inside the serialized transaction (request_hash mandatory)
             if idempotency_key:
                 idem_row = conn.execute(
                     """
@@ -447,7 +543,7 @@ class ProjectStore:
                 ).fetchone()
                 if idem_row is not None:
                     stored_hash = idem_row["request_hash"] or ""
-                    if stored_hash and req_hash and stored_hash != req_hash:
+                    if not stored_hash or stored_hash != req_hash:
                         raise IdempotencyKeyConflictError(
                             f"Idempotency key '{idempotency_key}' was already used with a different request payload.",
                             details={
@@ -468,21 +564,29 @@ class ProjectStore:
                 (project_id,),
             ).fetchone()
             if row is None:
-                raise KeyError(f"Project '{project_id}' not found in workspace '{self.workspace_root}'.")
+                raise ProjectNotFoundError(
+                    f"Project '{project_id}' not found in workspace '{self.workspace_root}'.",
+                    details={"project_id": project_id},
+                )
 
             expected_version = int(row["state_version"])
-            state = ProjectWorkspaceState.model_validate_json(row["state_json"])
+            state = self._hydrate_state_dict(
+                json.loads(row["state_json"]),
+                conn,
+                hydrate_slices=hydrate_slices,
+                hydrate_sections=hydrate_sections,
+            )
             state.state_version = expected_version
 
             # 3. Execute domain validation & state mutation
             result_dict, audit_summary, audit_payload = mutator(state, conn)
 
-            # 4. Prepare new state version and CAS update
+            # 4. Prepare new state version, offload blobs, and CAS update
             now_iso = datetime.now(timezone.utc).isoformat()
             new_version = expected_version + 1
             state.state_version = new_version
             state.updated_at = now_iso
-            state_json = json.dumps(state.model_dump(mode="json"), ensure_ascii=False, indent=2)
+            compact_json = self._compact_state_and_store_blobs(state, conn, now_iso)
 
             cur = conn.execute(
                 """
@@ -490,7 +594,7 @@ class ProjectStore:
                 SET stage = ?, updated_at = ?, state_version = ?, state_json = ?
                 WHERE project_id = ? AND state_version = ?
                 """,
-                (state.stage, now_iso, new_version, state_json, project_id, expected_version),
+                (state.stage, now_iso, new_version, compact_json, project_id, expected_version),
             )
             if cur.rowcount != 1:
                 raise RevisionConflictError(
@@ -538,7 +642,6 @@ class ProjectStore:
             )
 
             conn.execute("COMMIT")
-            committed_state = state
         except Exception:
             try:
                 conn.execute("ROLLBACK")
@@ -548,81 +651,43 @@ class ProjectStore:
         finally:
             conn.close()
 
-        if committed_state is not None:
-            self.sync_derived_snapshots(committed_state)
-
         return result_dict
 
-    def save_state(self, state: ProjectWorkspaceState) -> None:
-        """Direct save_state helper wrapped in atomic CAS update."""
-        project_id = validate_safe_identifier(state.brief.project_id, "project_id")
-        now_iso = datetime.now(timezone.utc).isoformat()
-        state.updated_at = now_iso
-
-        conn = self._connect(autocommit=True)
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT state_version FROM projects WHERE project_id = ?",
-                (project_id,),
-            ).fetchone()
-            if row is None:
-                state.state_version = 1
-                state_json = json.dumps(state.model_dump(mode="json"), ensure_ascii=False, indent=2)
-                conn.execute(
-                    """
-                    INSERT INTO projects (project_id, stage, updated_at, state_version, state_json)
-                    VALUES (?, ?, ?, 1, ?)
-                    """,
-                    (project_id, state.stage, now_iso, state_json),
-                )
-            else:
-                expected_version = int(row["state_version"])
-                new_version = expected_version + 1
-                state.state_version = new_version
-                state_json = json.dumps(state.model_dump(mode="json"), ensure_ascii=False, indent=2)
-                cur = conn.execute(
-                    """
-                    UPDATE projects
-                    SET stage = ?, updated_at = ?, state_version = ?, state_json = ?
-                    WHERE project_id = ? AND state_version = ?
-                    """,
-                    (state.stage, now_iso, new_version, state_json, project_id, expected_version),
-                )
-                if cur.rowcount != 1:
-                    raise RevisionConflictError(
-                        f"Concurrent state update conflict on project '{project_id}'."
-                    )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
-        finally:
-            conn.close()
-
-        self.sync_derived_snapshots(state)
-
-    def load_state(self, project_id: str) -> ProjectWorkspaceState:
-        """Load authoritative state from SQLite."""
+    def load_state(
+        self,
+        project_id: str,
+        *,
+        hydrate_slices: bool = True,
+        hydrate_sections: bool = True,
+    ) -> ProjectWorkspaceState:
+        """Read-only load of authoritative state from SQLite (never resurrects from JSON snapshots)."""
         validate_safe_identifier(project_id, "project_id")
-        with self._connect() as conn:
+        if not self.db_path.exists():
+            raise ProjectNotFoundError(
+                f"Project '{project_id}' not found (database does not exist).",
+                details={"project_id": project_id},
+            )
+        with closing(self._connect(readonly=True)) as conn:
             row = conn.execute(
                 "SELECT state_version, state_json FROM projects WHERE project_id = ?",
                 (project_id,),
             ).fetchone()
-        if row is not None:
-            st = ProjectWorkspaceState.model_validate_json(row["state_json"])
+            if row is None:
+                raise ProjectNotFoundError(
+                    f"Project '{project_id}' not found in workspace '{self.workspace_root}'.",
+                    details={"project_id": project_id},
+                )
+            st = self._hydrate_state_dict(
+                json.loads(row["state_json"]),
+                conn,
+                hydrate_slices=hydrate_slices,
+                hydrate_sections=hydrate_sections,
+            )
             st.state_version = int(row["state_version"])
             return st
 
-        snapshot_path = self.get_project_dir(project_id) / "state_snapshot.json"
-        if snapshot_path.exists():
-            return ProjectWorkspaceState.model_validate_json(snapshot_path.read_text(encoding="utf-8"))
-
-        raise KeyError(f"Project '{project_id}' not found in workspace '{self.workspace_root}'.")
-
     # =========================================================================
-    # R2-P0-01: Non-Privileged Approval Requests & Trusted Human Confirmation
+    # Approval Requests & Local User Decisions
     # =========================================================================
 
     @staticmethod
@@ -634,20 +699,26 @@ class ProjectStore:
         artifact_hash: str,
         ttl_seconds: int = 3600,
     ) -> ApprovalRequest:
-        """Create a non-privileged pending ApprovalRequest in state (never returns any secret token)."""
+        """Create or deduplicate a pending ApprovalRequest bound to (artifact_type, target_id, artifact_hash)."""
         now = datetime.now(timezone.utc)
         expires = now + timedelta(seconds=ttl_seconds)
         normalized_hash = (
             artifact_hash if artifact_hash.startswith("sha256:") else f"sha256:{artifact_hash}"
         )
 
-        # Supersede any prior pending request for the same target
+        # P1-4: Deduplicate pending request with identical (artifact_type, target_id, artifact_hash)
         for existing_req in state.approval_requests.values():
             if (
                 existing_req.artifact_type == artifact_type
                 and existing_req.target_id == target_id
                 and existing_req.status == "pending"
             ):
+                if (
+                    existing_req.artifact_hash == normalized_hash
+                    and existing_req.artifact_revision == artifact_revision
+                    and datetime.fromisoformat(existing_req.expires_at) > now
+                ):
+                    return existing_req
                 existing_req.status = "stale"
 
         req_id = f"aprq_{secrets.token_hex(8)}"
@@ -677,10 +748,10 @@ class ProjectStore:
         current_hash: str,
         comment: str = "",
     ) -> tuple[ApprovalRequest, ApprovalDecision]:
-        """Record a human approval/rejection decision inside the trusted confirmation domain (R2-P0-01)."""
+        """Record a local user approval/rejection decision."""
         if confirmation_channel not in {"local_ui", "local_cli"}:
             raise UntrustedApprovalChannelError(
-                f"Channel '{confirmation_channel}' is not a trusted human confirmation channel.",
+                f"Channel '{confirmation_channel}' is not a valid local user confirmation channel.",
                 details={"confirmation_channel": confirmation_channel},
             )
         normalized_actor = (human_actor_id or "").strip().lower()
@@ -754,12 +825,10 @@ class ProjectStore:
         req.decision = decision_record
         return req, decision_record
 
-    # =========================================================================
-    # Internal Hashed One-Time Tokens (Trusted Domain / Legacy Test Harness Only)
-    # =========================================================================
-
     def list_projects(self) -> list[dict[str, Any]]:
-        with self._connect() as conn:
+        if not self.db_path.exists():
+            return []
+        with closing(self._connect(readonly=True)) as conn:
             rows = conn.execute(
                 "SELECT project_id, stage, state_version, updated_at FROM projects ORDER BY updated_at DESC"
             ).fetchall()
@@ -775,7 +844,7 @@ class ProjectStore:
         validate_safe_identifier(project_id, "project_id")
         now_iso = datetime.now(timezone.utc).isoformat()
         payload_data = payload or {}
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.execute(
                 """
                 INSERT INTO audit_events (project_id, timestamp, event_type, summary, payload_json)
@@ -791,21 +860,11 @@ class ProjectStore:
             )
             conn.commit()
 
-        project_dir = self.ensure_project_dirs(project_id)
-        audit_jsonl = project_dir / "logs" / "audit_events.jsonl"
-        record = {
-            "timestamp": now_iso,
-            "project_id": project_id,
-            "event_type": event_type,
-            "summary": summary,
-            "payload": payload_data,
-        }
-        with audit_jsonl.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-
     def get_audit_events(self, project_id: str) -> list[dict[str, Any]]:
         validate_safe_identifier(project_id, "project_id")
-        with self._connect() as conn:
+        if not self.db_path.exists():
+            return []
+        with closing(self._connect(readonly=True)) as conn:
             rows = conn.execute(
                 """
                 SELECT id, timestamp, event_type, summary, payload_json
@@ -815,15 +874,13 @@ class ProjectStore:
                 """,
                 (project_id,),
             ).fetchall()
-        events: list[dict[str, Any]] = []
-        for r in rows:
-            events.append(
-                {
-                    "id": r["id"],
-                    "timestamp": r["timestamp"],
-                    "event_type": r["event_type"],
-                    "summary": r["summary"],
-                    "payload": json.loads(r["payload_json"]),
-                }
-            )
-        return events
+        return [
+            {
+                "id": r["id"],
+                "timestamp": r["timestamp"],
+                "event_type": r["event_type"],
+                "summary": r["summary"],
+                "payload": json.loads(r["payload_json"]),
+            }
+            for r in rows
+        ]

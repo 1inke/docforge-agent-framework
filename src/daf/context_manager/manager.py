@@ -97,6 +97,10 @@ HYPOTHESIS_FALSE_EXPERIMENT_MARKERS: tuple[str, ...] = (
 )
 
 
+from functools import lru_cache
+
+
+@lru_cache(maxsize=4096)
 def normalize_for_verification(text: str) -> str:
     """Normalize whitespace and common quote/dash variants for deterministic substring matching."""
     if not text:
@@ -1064,7 +1068,8 @@ class ContextManager:
             )
 
         norm_excerpt = normalize_for_verification(quote_excerpt)
-        if norm_excerpt and norm_excerpt in source_slice.normalized_text:
+        norm_slice = source_slice.normalized_text or normalize_for_verification(source_slice.raw_text)
+        if norm_excerpt and norm_excerpt in norm_slice:
             l1_status: Literal["matched", "not_matched"] = "matched"
             v_status: Literal["verified", "unverified_excerpt"] = "verified"
             note = (

@@ -259,8 +259,24 @@ class ContextBudgetExceededError(ContractValidationError):
 
 
 class ReviewChecklistIncompleteError(ContractValidationError):
-    """Raised when semantic review checklist_results are incomplete, duplicated, or mismatched with task checklist_hash (R3-01 §6.2)."""
+    """Raised when semantic review checklist_results are incomplete, duplicated, or mismatched with task checklist_hash."""
 
     default_code = "REVIEW_CHECKLIST_INCOMPLETE"
     default_retryable = True
     default_recommended_tool = "list_semantic_review_tasks"
+
+
+class ProjectNotFoundError(DAFError, KeyError):
+    """Raised when a requested project_id does not exist in SQLite."""
+
+    default_code = "PROJECT_NOT_FOUND"
+    default_retryable = False
+    default_recommended_tool = "create_project"
+
+
+class SectionNotFoundError(DAFError, KeyError):
+    """Raised when a requested section_id does not exist in the project."""
+
+    default_code = "SECTION_NOT_FOUND"
+    default_retryable = False
+    default_recommended_tool = "get_project_status"
