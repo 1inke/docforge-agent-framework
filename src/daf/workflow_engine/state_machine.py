@@ -29,9 +29,11 @@ from daf.core.contracts import (
 )
 from daf.core.errors import (
     ApprovalConflictError,
+    BibliographyMissingError,
     ClaimReviewPendingError,
     ContextStaleError,
     ContractValidationError,
+    CrossrefUnresolvedError,
     EvidenceChangedError,
     RevisionConflictError,
     SemanticReviewRequiredError,
@@ -52,6 +54,29 @@ def count_effective_words(markdown_text: str) -> int:
     cjk_chars = re.findall(r"[\u4e00-\u9fff]", markdown_text)
     latin_words = re.findall(r"[A-Za-z0-9_]+", markdown_text)
     return len(cjk_chars) + len(latin_words)
+
+
+def effective_section_ids(state: ProjectWorkspaceState) -> list[str]:
+    """Return canonical section IDs: outline nodes if planned, otherwise profile required sections."""
+    if state.outline_graph.nodes:
+        return [n.section_id for n in state.outline_graph.nodes]
+    return [s.section_id for s in state.profile.structure_profile.required_sections]
+
+
+def _has_valid_bibliography(bib: dict[str, Any] | None) -> bool:
+    if not isinstance(bib, dict):
+        return False
+    title = str(bib.get("title") or "").strip()
+    author = bib.get("author")
+    issued = bib.get("issued")
+    has_author = isinstance(author, list) and len(author) > 0 and any(
+        isinstance(a, dict) and bool(a.get("family") or a.get("literal") or a.get("given"))
+        for a in author
+    )
+    has_issued = isinstance(issued, dict) and bool(
+        issued.get("date-parts") or issued.get("raw") or issued.get("literal")
+    )
+    return bool(title and has_author and has_issued)
 
 
 def compute_final_draft_aggregate_hash(state: ProjectWorkspaceState) -> str:
@@ -321,8 +346,8 @@ def assert_release_ready(state: ProjectWorkspaceState) -> dict[str, Any]:
             },
         )
 
-    # 2. Required sections present, non-empty, and not preapproval drafts
-    required_ids = [s.section_id for s in state.profile.structure_profile.required_sections]
+    # 2. Effective sections present, non-empty, and not preapproval drafts
+    required_ids = effective_section_ids(state)
     missing_or_empty: list[str] = []
     preapproval_sections: list[str] = []
     for sid in required_ids:
@@ -364,6 +389,45 @@ def assert_release_ready(state: ProjectWorkspaceState) -> dict[str, Any]:
                 code="APPROVAL_REQUIRED",
                 details={"unacknowledged_conflicts": unack_major},
             )
+
+    # 6b. R1: All cited source documents must have user-confirmed CSL-JSON bibliography
+    missing_bib_sources: list[str] = []
+    seen_cited_sources: set[str] = set()
+    for sid in effective_section_ids(state):
+        sec = state.section_versions.sections.get(sid)
+        if sec is None or sec.revision == 0:
+            continue
+        for b in sec.source_bindings:
+            if not b.evidence_id:
+                continue
+            ev = state.evidence_ledger.items.get(b.evidence_id)
+            if ev is None or ev.source_id in seen_cited_sources:
+                continue
+            seen_cited_sources.add(ev.source_id)
+            doc_rec = state.source_registry.documents.get(ev.source_id)
+            if doc_rec is None or not _has_valid_bibliography(doc_rec.bibliography):
+                missing_bib_sources.append(ev.source_id)
+    if missing_bib_sources:
+        raise BibliographyMissingError(
+            f"Release blocked: cited source(s) lack user-confirmed bibliography (title, author, issued): {sorted(missing_bib_sources)}.",
+            details={"missing_source_ids": sorted(missing_bib_sources)},
+        )
+
+    # 6c. R2: All cross-references across effective sections must resolve to defined labels
+    all_defined_labels: set[str] = set()
+    all_xref_targets: list[str] = []
+    for sid in effective_section_ids(state):
+        sec = state.section_versions.sections.get(sid)
+        if sec is None or sec.revision == 0:
+            continue
+        all_defined_labels.update(sec.defined_labels)
+        all_xref_targets.extend(sec.crossref_targets)
+    unresolved_xrefs = sorted({x for x in all_xref_targets if x not in all_defined_labels})
+    if unresolved_xrefs:
+        raise CrossrefUnresolvedError(
+            f"Release blocked: unresolved cross-reference target(s): {unresolved_xrefs}.",
+            details={"unresolved_crossrefs": unresolved_xrefs, "defined_labels": sorted(all_defined_labels)},
+        )
 
     # 7. final_draft approval matches live aggregate content hash (cannot be bypassed via approval_policy)
     live_agg_hash = compute_final_draft_aggregate_hash(state)
@@ -619,16 +683,17 @@ class WorkflowEngine:
         from daf.core.contracts import ReviewIssue
         from daf.core.pandoc_ast import (
             analyze_markdown_with_pandoc,
+            classify_uncited_sentence,
             hypothesis_has_false_experiment_marker,
-            sentence_needs_citation,
         )
 
-        parsed_sentences, _ast_stats, _ast = analyze_markdown_with_pandoc(submission.content_markdown)
+        parsed_sentences, ast_stats, _ast = analyze_markdown_with_pandoc(submission.content_markdown)
         bound_evidence_ids: list[str] = []
         enriched_bindings: list[SourceBinding] = []
         derived_claims: list[str] = []
         l2_warnings: list[dict[str, str]] = []
         uncited_issues: list[dict[str, Any]] = []
+        extra_units = list(state.profile.content_profile.extra_physical_units)
 
         # Clear previous open UNCITED_FACTUAL_CLAIM issues for this section before re-evaluating
         for old_iss in state.review_ledger.issues:
@@ -642,8 +707,9 @@ class WorkflowEngine:
 
         for sent in parsed_sentences:
             if not sent.citation_ids and not sent.is_hypothesis:
-                # R-A: uncited quantitative/comparative factual claim
-                if sentence_needs_citation(sent.text):
+                # R-A (narrowed R3): check uncited factual/comparative sentences
+                sev = classify_uncited_sentence(sent.text, extra_units=extra_units)
+                if sev is not None:
                     issue_id = f"uncited_{section_id}_r{new_rev}_s{sent.index:03d}"
                     issue_desc = (
                         f"Uncited factual/quantitative sentence in section '{section_id}': "
@@ -653,7 +719,7 @@ class WorkflowEngine:
                         {
                             "issue_id": issue_id,
                             "category": "UNCITED_FACTUAL_CLAIM",
-                            "severity": "major",
+                            "severity": sev,
                             "sentence_index": sent.index,
                             "sentence_text": sent.text,
                             "description": issue_desc,
@@ -663,7 +729,7 @@ class WorkflowEngine:
                         ReviewIssue(
                             issue_id=issue_id,
                             target_section_id=section_id,
-                            severity="major",
+                            severity=sev,
                             category="UNCITED_FACTUAL_CLAIM",
                             description=issue_desc,
                             suggested_fix="Add a verified inline citation [@ev_id] or mark the statement with [@hypothesis].",
@@ -824,6 +890,8 @@ class WorkflowEngine:
         existing_sec.claims = derived_claims
         existing_sec.source_bindings = enriched_bindings
         existing_sec.uncited_claim_issues = uncited_issues
+        existing_sec.defined_labels = list(ast_stats.defined_labels)
+        existing_sec.crossref_targets = list(ast_stats.crossref_targets)
         existing_sec.unresolved_questions = list(submission.unresolved_questions)
         existing_sec.needs_revalidation = False
         existing_sec.stale_reason = ""

@@ -17,6 +17,7 @@ from daf.core.contracts import (
     StructureProfile,
 )
 from daf.core.errors import (
+    BibliographyMissingError,
     ProjectAlreadyExistsError,
     SecurityBoundaryError,
     SourcePolicyChangeRequiresHumanError,
@@ -302,6 +303,30 @@ def test_end_to_end_template_agnostic_workflow(tmp_path: Path) -> None:
             decided_by="local_user",
             confirmation_channel="local_cli",
         )
+
+        with pytest.raises(BibliographyMissingError):
+            engine.render_document(project_id="proj_e2e", purpose="release")
+
+        prop = engine.call_agent_tool(
+            "propose_source_bibliography",
+            {
+                "project_id": "proj_e2e",
+                "source_id": source_id,
+                "csl_json": {
+                    "type": "article-journal",
+                    "title": "Latency Reduction Pipeline Evaluation",
+                    "author": [{"family": "Zhang", "given": "San"}],
+                    "issued": {"date-parts": [[2025]]},
+                },
+            },
+        )
+        assert prop["confirmed"] is False
+        with pytest.raises(SourcePolicyChangeRequiresHumanError):
+            engine.call_agent_tool(
+                "adopt_source_bibliography_by_user",
+                {"project_id": "proj_e2e", "source_id": source_id},
+            )
+        engine.adopt_source_bibliography_by_user(project_id="proj_e2e", source_id=source_id)
 
         render_res = engine.render_document(project_id="proj_e2e", purpose="release")
         assert Path(render_res["docx_path"]).exists()

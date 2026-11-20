@@ -1,20 +1,21 @@
-"""Single-pass Pandoc DOCX renderer with CSL bibliography, Lua cross-references, and OMML equations (P1-3)."""
+"""Single-pass Pandoc DOCX renderer with source-level CSL bibliography, two-pass Lua crossrefs, and OMML."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-import shutil
 import subprocess
 import tempfile
 from typing import Any
 
 import docx
 from docx.shared import Inches, Pt
+import yaml
 
 from daf.core.contracts import LayoutProfile, ProjectWorkspaceState
 from daf.core.errors import PandocUnavailableError, TemplateRenderError
 from daf.core.pandoc_ast import find_pandoc_binary
+from daf.workflow_engine.state_machine import _has_valid_bibliography, effective_section_ids
 
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 DEFAULT_CSL_PATH = ASSETS_DIR / "gb-t-7714-2015-numeric.csl"
@@ -36,31 +37,62 @@ def build_reference_docx(layout: LayoutProfile, out_path: Path) -> Path:
     return out_path
 
 
-def collect_csl_bibliography(state: ProjectWorkspaceState) -> list[dict[str, Any]]:
-    """Map every cited EvidenceItem ID to a CSL-JSON entry derived from its SourceDocumentRecord."""
-    entries: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
-    for ev_id, ev in state.evidence_ledger.items.items():
-        if ev_id in seen_ids:
+def collect_csl_bibliography_and_map(
+    state: ProjectWorkspaceState,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, str]]]:
+    """Build source-keyed CSL entries and evidence_id -> {source, locator} mapping.
+
+    Only sources actually cited by drafted effective sections are included in the bibliography.
+    Missing bibliography entries in preview mode emit a visible placeholder title and NEVER
+    fabricate authors or years.
+    """
+    evidence_map: dict[str, dict[str, str]] = {}
+    cited_source_ids: list[str] = []
+    seen_sources: set[str] = set()
+
+    for sid in effective_section_ids(state):
+        sec = state.section_versions.sections.get(sid)
+        if sec is None or sec.revision == 0:
             continue
-        seen_ids.add(ev_id)
-        doc_rec = state.source_registry.documents.get(ev.source_id)
-        if doc_rec and doc_rec.bibliography:
+        for b in sec.source_bindings:
+            if not b.evidence_id:
+                continue
+            ev = state.evidence_ledger.items.get(b.evidence_id)
+            if ev is None:
+                continue
+            evidence_map[ev.evidence_id] = {
+                "source": ev.source_id,
+                "locator": ev.locator or "",
+            }
+            if ev.source_id not in seen_sources:
+                seen_sources.add(ev.source_id)
+                cited_source_ids.append(ev.source_id)
+
+    # Also include any registered evidence mapping so crossref.lua can resolve citations in preview
+    for ev_id, ev in state.evidence_ledger.items.items():
+        if ev_id not in evidence_map:
+            evidence_map[ev_id] = {
+                "source": ev.source_id,
+                "locator": ev.locator or "",
+            }
+
+    entries: list[dict[str, Any]] = []
+    for src_id in cited_source_ids:
+        doc_rec = state.source_registry.documents.get(src_id)
+        if doc_rec and _has_valid_bibliography(doc_rec.bibliography):
             entry = dict(doc_rec.bibliography)
-            entry["id"] = ev_id
+            entry["id"] = src_id
             entries.append(entry)
         else:
-            title = doc_rec.file_name if doc_rec else ev.source_id
+            fname = doc_rec.file_name if doc_rec else src_id
             entries.append(
                 {
-                    "id": ev_id,
+                    "id": src_id,
                     "type": "article-journal",
-                    "title": title,
-                    "author": [{"literal": "Source Document"}],
-                    "issued": {"date-parts": [[2026]]},
+                    "title": f"【未登记文献信息：{fname}】",
                 }
             )
-    return entries
+    return entries, evidence_map
 
 
 def render_document_single_pass_pandoc(
@@ -72,16 +104,12 @@ def render_document_single_pass_pandoc(
     csl_path: Path | None = None,
     pandoc_bin: str | None = None,
 ) -> dict[str, Any]:
-    """Assemble full Markdown from outline-ordered sections and compile once via Pandoc to DOCX."""
+    """Assemble full Markdown from effective sections and compile once via Pandoc to DOCX."""
     binary = pandoc_bin or find_pandoc_binary()
     if not binary:
         raise PandocUnavailableError("Pandoc executable is required for single-pass DOCX rendering.")
 
-    ordered_ids = (
-        [n.section_id for n in state.outline_graph.nodes]
-        if state.outline_graph.nodes
-        else list(state.section_versions.sections.keys())
-    )
+    ordered_ids = effective_section_ids(state) or list(state.section_versions.sections.keys())
 
     md_parts: list[str] = [f"# {state.brief.title}\n"]
     if purpose == "preview":
@@ -95,13 +123,22 @@ def render_document_single_pass_pandoc(
         section_count += 1
         md_parts.append(f"\n## {sec.title}\n\n{sec.content_markdown.strip()}\n")
 
-    full_markdown = "\n".join(md_parts)
-    csl_entries = collect_csl_bibliography(state)
+    csl_entries, evidence_map = collect_csl_bibliography_and_map(state)
     has_bib = bool(csl_entries)
+    if has_bib:
+        md_parts.append("\n## 参考文献\n")
+
+    full_markdown = "\n".join(md_parts)
 
     with tempfile.TemporaryDirectory(prefix="daf_pandoc_") as tmpdir:
         tmp = Path(tmpdir)
         ref_docx = build_reference_docx(state.profile.layout_profile, tmp / "reference.docx")
+        meta_yaml = tmp / "metadata.yaml"
+        meta_yaml.write_text(
+            yaml.safe_dump({"daf-evidence-map": evidence_map}, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+
         cmd = [
             binary,
             "-f",
@@ -109,16 +146,14 @@ def render_document_single_pass_pandoc(
             "-t",
             "docx",
             f"--reference-doc={ref_docx}",
+            f"--metadata-file={meta_yaml}",
             "-o",
             str(output_docx_path),
         ]
         if project_dir is not None:
             cmd.append(f"--resource-path={project_dir}")
 
-        crossref_bin = shutil.which("pandoc-crossref")
-        if crossref_bin:
-            cmd.extend(["--filter", crossref_bin])
-        elif DEFAULT_CROSSREF_LUA.is_file():
+        if DEFAULT_CROSSREF_LUA.is_file():
             cmd.extend(["--lua-filter", str(DEFAULT_CROSSREF_LUA)])
 
         if has_bib:

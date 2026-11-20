@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -22,6 +23,7 @@ from daf.core.errors import (
     ProjectNotFoundError,
     RevisionConflictError,
     SecurityBoundaryError,
+    StateCorruptedError,
     UntrustedApprovalChannelError,
 )
 
@@ -122,6 +124,42 @@ def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+MAX_BLOB_CACHE_BYTES = 64 * 1024 * 1024
+
+
+class _BlobLRUCache:
+    """Bounded UTF-8 byte-size LRU cache for immutable committed content blobs."""
+
+    def __init__(self, max_bytes: int = MAX_BLOB_CACHE_BYTES) -> None:
+        self.max_bytes = max_bytes
+        self._items: OrderedDict[str, tuple[str, int]] = OrderedDict()
+        self._total_bytes = 0
+
+    def get(self, sha: str) -> str | None:
+        entry = self._items.get(sha)
+        if entry is None:
+            return None
+        self._items.move_to_end(sha)
+        return entry[0]
+
+    def put(self, sha: str, content: str) -> None:
+        size = len(content.encode("utf-8"))
+        if size > self.max_bytes:
+            return
+        if sha in self._items:
+            old_size = self._items.pop(sha)[1]
+            self._total_bytes -= old_size
+        while self._total_bytes + size > self.max_bytes and self._items:
+            _k, (_v, evicted_size) = self._items.popitem(last=False)
+            self._total_bytes -= evicted_size
+        self._items[sha] = (content, size)
+        self._total_bytes += size
+
+    def put_many(self, mapping: dict[str, str]) -> None:
+        for sha, content in mapping.items():
+            self.put(sha, content)
+
+
 class ProjectStore:
     """SQLite authoritative state store with content-addressed immutable blobs and CAS transactions."""
 
@@ -134,7 +172,7 @@ class ProjectStore:
         self.workspace_root = raw_root.resolve()
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self.db_path = self.workspace_root / "daf_workspace.sqlite3"
-        self._blob_cache: dict[str, str] = {}
+        self._blob_cache = _BlobLRUCache()
         self._init_db()
 
     def _connect(self, autocommit: bool = False, readonly: bool = False) -> sqlite3.Connection:
@@ -268,20 +306,27 @@ class ProjectStore:
     # Content-Addressed Blob Extraction & Hydration (P1-1)
     # =========================================================================
 
-    def _put_blob_in_tx(self, conn: sqlite3.Connection, sha: str, content: str, now_iso: str) -> None:
-        if sha in self._blob_cache:
-            return
+    def _put_blob_in_tx(
+        self,
+        conn: sqlite3.Connection,
+        sha: str,
+        content: str,
+        now_iso: str,
+        pending_blobs: dict[str, str],
+    ) -> None:
+        # Always issue idempotent SQLite INSERT; never skip based on in-process cache
         conn.execute(
             "INSERT OR IGNORE INTO blobs (sha256, content, created_at) VALUES (?, ?, ?)",
             (sha, content, now_iso),
         )
-        self._blob_cache[sha] = content
+        pending_blobs[sha] = content
 
     def _compact_state_and_store_blobs(
         self,
         state: ProjectWorkspaceState,
         conn: sqlite3.Connection,
         now_iso: str,
+        pending_blobs: dict[str, str],
     ) -> str:
         """Store immutable slice/section text blobs separately and return compact metadata-only JSON."""
         project_id = state.brief.project_id
@@ -294,7 +339,7 @@ class ProjectStore:
             sha = sl.get("sha256") or _sha256_text(raw_text)
             sl["sha256"] = sha
             if raw_text:
-                self._put_blob_in_tx(conn, sha, raw_text, now_iso)
+                self._put_blob_in_tx(conn, sha, raw_text, now_iso, pending_blobs)
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO source_slices
@@ -320,7 +365,7 @@ class ProjectStore:
             if cur_md:
                 chash = sec.get("content_hash") or _sha256_text(cur_md)
                 sec["content_hash"] = chash
-                self._put_blob_in_tx(conn, chash, cur_md, now_iso)
+                self._put_blob_in_tx(conn, chash, cur_md, now_iso, pending_blobs)
             sec["content_markdown"] = ""
 
             for hist in sec.get("history") or []:
@@ -328,7 +373,7 @@ class ProjectStore:
                 h_hash = hist.get("content_hash") or (_sha256_text(h_md) if h_md else "")
                 if h_md and h_hash:
                     hist["content_hash"] = h_hash
-                    self._put_blob_in_tx(conn, h_hash, h_md, now_iso)
+                    self._put_blob_in_tx(conn, h_hash, h_md, now_iso, pending_blobs)
                     conn.execute(
                         """
                         INSERT OR IGNORE INTO section_revisions
@@ -360,7 +405,6 @@ class ProjectStore:
             else:
                 missing.append(sha)
         if missing:
-            # SQLite parameter limit safety: fetch in chunks of 500
             for i in range(0, len(missing), 500):
                 chunk = missing[i : i + 500]
                 placeholders = ",".join("?" for _ in chunk)
@@ -371,7 +415,7 @@ class ProjectStore:
                 for r in rows:
                     s_val = str(r["sha256"])
                     c_val = str(r["content"])
-                    self._blob_cache[s_val] = c_val
+                    self._blob_cache.put(s_val, c_val)
                     result[s_val] = c_val
         return result
 
@@ -400,18 +444,37 @@ class ProjectStore:
                         needed.add(hist["content_hash"])
 
         blobs = self._fetch_blobs(conn, needed) if needed else {}
+        missing_refs: list[dict[str, str]] = []
 
         if hydrate_slices:
-            for sl in slices_dict.values():
-                if not sl.get("raw_text") and sl.get("sha256") in blobs:
-                    sl["raw_text"] = blobs[sl["sha256"]]
+            for slice_id, sl in slices_dict.items():
+                sha = sl.get("sha256")
+                if not sl.get("raw_text") and sha:
+                    if sha in blobs:
+                        sl["raw_text"] = blobs[sha]
+                    else:
+                        missing_refs.append({"owner": f"slice:{slice_id}", "sha256": sha})
         if hydrate_sections:
-            for sec in sections_dict.values():
-                if not sec.get("content_markdown") and sec.get("content_hash") in blobs:
-                    sec["content_markdown"] = blobs[sec["content_hash"]]
+            for sec_id, sec in sections_dict.items():
+                chash = sec.get("content_hash")
+                if not sec.get("content_markdown") and chash:
+                    if chash in blobs:
+                        sec["content_markdown"] = blobs[chash]
+                    else:
+                        missing_refs.append({"owner": f"section:{sec_id}@r{sec.get('revision', 0)}", "sha256": chash})
                 for hist in sec.get("history") or []:
-                    if not hist.get("content_markdown") and hist.get("content_hash") in blobs:
-                        hist["content_markdown"] = blobs[hist["content_hash"]]
+                    hhash = hist.get("content_hash")
+                    if not hist.get("content_markdown") and hhash:
+                        if hhash in blobs:
+                            hist["content_markdown"] = blobs[hhash]
+                        else:
+                            missing_refs.append({"owner": f"section_history:{sec_id}@r{hist.get('revision', 0)}", "sha256": hhash})
+
+        if missing_refs:
+            raise StateCorruptedError(
+                f"SQLite state references {len(missing_refs)} missing blob(s): {missing_refs[:5]}",
+                details={"missing_blobs": missing_refs},
+            )
 
         return ProjectWorkspaceState.model_validate(state_dict)
 
@@ -447,6 +510,7 @@ class ProjectStore:
         state.state_version = 1
 
         conn = self._connect(autocommit=True)
+        pending_blobs: dict[str, str] = {}
         try:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
@@ -463,7 +527,7 @@ class ProjectStore:
                         "existing_state_version": int(existing["state_version"]),
                     },
                 )
-            compact_json = self._compact_state_and_store_blobs(state, conn, now_iso)
+            compact_json = self._compact_state_and_store_blobs(state, conn, now_iso, pending_blobs)
             conn.execute(
                 """
                 INSERT INTO projects (project_id, stage, updated_at, state_version, state_json)
@@ -485,6 +549,7 @@ class ProjectStore:
                 ),
             )
             conn.execute("COMMIT")
+            self._blob_cache.put_many(pending_blobs)
         except sqlite3.IntegrityError as exc:
             try:
                 conn.execute("ROLLBACK")
@@ -528,6 +593,7 @@ class ProjectStore:
         )
 
         conn = self._connect(autocommit=True)
+        pending_blobs: dict[str, str] = {}
         try:
             conn.execute("BEGIN IMMEDIATE")
 
@@ -586,7 +652,7 @@ class ProjectStore:
             new_version = expected_version + 1
             state.state_version = new_version
             state.updated_at = now_iso
-            compact_json = self._compact_state_and_store_blobs(state, conn, now_iso)
+            compact_json = self._compact_state_and_store_blobs(state, conn, now_iso, pending_blobs)
 
             cur = conn.execute(
                 """
@@ -642,6 +708,7 @@ class ProjectStore:
             )
 
             conn.execute("COMMIT")
+            self._blob_cache.put_many(pending_blobs)
         except Exception:
             try:
                 conn.execute("ROLLBACK")
@@ -685,6 +752,71 @@ class ProjectStore:
             )
             st.state_version = int(row["state_version"])
             return st
+
+    def doctor_project(self, project_id: str) -> dict[str, Any]:
+        """Verify that every blob sha referenced by projects/source_slices/section_revisions exists in blobs."""
+        validate_safe_identifier(project_id, "project_id")
+        if not self.db_path.exists():
+            raise ProjectNotFoundError(
+                f"Project '{project_id}' not found (database does not exist).",
+                details={"project_id": project_id},
+            )
+        with closing(self._connect(readonly=True)) as conn:
+            row = conn.execute(
+                "SELECT state_version, state_json FROM projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            if row is None:
+                raise ProjectNotFoundError(
+                    f"Project '{project_id}' not found in workspace '{self.workspace_root}'.",
+                    details={"project_id": project_id},
+                )
+            state_dict = json.loads(row["state_json"])
+            refs: list[tuple[str, str]] = []
+            for slice_id, sl in state_dict.get("source_registry", {}).get("slices", {}).items():
+                if sl.get("sha256"):
+                    refs.append((f"state_slice:{slice_id}", sl["sha256"]))
+            for sec_id, sec in state_dict.get("section_versions", {}).get("sections", {}).items():
+                if sec.get("content_hash"):
+                    refs.append((f"state_section:{sec_id}@r{sec.get('revision', 0)}", sec["content_hash"]))
+                for hist in sec.get("history") or []:
+                    if hist.get("content_hash"):
+                        refs.append((f"state_history:{sec_id}@r{hist.get('revision', 0)}", hist["content_hash"]))
+            for sr in conn.execute(
+                "SELECT slice_id, blob_sha256 FROM source_slices WHERE project_id = ?",
+                (project_id,),
+            ).fetchall():
+                refs.append((f"table_slice:{sr['slice_id']}", sr["blob_sha256"]))
+            for rr in conn.execute(
+                "SELECT section_id, revision, blob_sha256 FROM section_revisions WHERE project_id = ?",
+                (project_id,),
+            ).fetchall():
+                refs.append((f"table_revision:{rr['section_id']}@r{rr['revision']}", rr["blob_sha256"]))
+
+            all_shas = {sha for _owner, sha in refs if sha}
+            present: set[str] = set()
+            sha_list = sorted(all_shas)
+            for i in range(0, len(sha_list), 500):
+                chunk = sha_list[i : i + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                for br in conn.execute(
+                    f"SELECT sha256 FROM blobs WHERE sha256 IN ({placeholders})",
+                    chunk,
+                ).fetchall():
+                    present.add(str(br["sha256"]))
+
+            missing = [
+                {"owner": owner, "sha256": sha}
+                for owner, sha in refs
+                if sha and sha not in present
+            ]
+        return {
+            "project_id": project_id,
+            "ok": len(missing) == 0,
+            "checked_refs": len(refs),
+            "unique_blobs": len(all_shas),
+            "missing_blobs": missing,
+        }
 
     # =========================================================================
     # Approval Requests & Local User Decisions

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import hmac
+import json
 import secrets
 import socket
 from pathlib import Path
@@ -113,6 +114,33 @@ def create_local_ui_app(
             for e in state.decision_log.entries
             if e.source == "agent_note" and not e.adopted_as_constraint
         )
+        source_bib_rows: list[str] = []
+        for doc in state.source_registry.documents.values():
+            confirmed_txt = (
+                json.dumps(doc.bibliography, ensure_ascii=False, indent=2)
+                if doc.bibliography
+                else "(not confirmed)"
+            )
+            proposal_block = ""
+            default_textarea = (
+                json.dumps(doc.bibliography or doc.proposed_bibliography or {"id": doc.source_id, "title": "", "author": [{"family": "", "given": ""}], "issued": {"date-parts": [[2025]]}}, ensure_ascii=False, indent=2)
+            )
+            if doc.proposed_bibliography:
+                proposal_txt = json.dumps(doc.proposed_bibliography, ensure_ascii=False, indent=2)
+                proposal_block = (
+                    f"<p>Proposed CSL-JSON:</p><pre>{_esc(proposal_txt)}</pre>"
+                    f"<form method='post' action='/projects/{_esc(project_id)}/sources/{_esc(doc.source_id)}/adopt-bibliography?token={_esc(token)}'>"
+                    f"<button type='submit'>Adopt Proposal</button></form>"
+                )
+            source_bib_rows.append(
+                f"<li style='margin-bottom:1rem;'><code>{_esc(doc.source_id)}</code> ({_esc(doc.file_name)})"
+                f"<p>Confirmed CSL-JSON:</p><pre>{_esc(confirmed_txt)}</pre>"
+                f"{proposal_block}"
+                f"<form method='post' action='/projects/{_esc(project_id)}/sources/{_esc(doc.source_id)}/bibliography?token={_esc(token)}'>"
+                f"<textarea name='csl_json' rows='5' style='width:100%;font-family:monospace;'>{_esc(default_textarea)}</textarea><br/>"
+                f"<button type='submit'>Confirm CSL-JSON</button></form></li>"
+            )
+        sources_html = "".join(source_bib_rows)
         preview_link = (
             f"<p><a href='/projects/{_esc(project_id)}/preview-docx?token={_esc(token)}'>Download Preview DOCX</a></p>"
             if state.last_rendered_docx_path and Path(state.last_rendered_docx_path).is_file()
@@ -124,6 +152,7 @@ def create_local_ui_app(
         <p>Stage: <strong>{_esc(state.stage)}</strong> | Profile: <code>{_esc(state.profile.profile_id)}</code></p>
         {preview_link}
         <h2>Approval Requests</h2>{''.join(approvals_html) or '<p>No approval requests.</p>'}
+        <h2>Sources &amp; Bibliography (CSL-JSON)</h2><ul>{sources_html or '<li>No sources ingested.</li>'}</ul>
         <h2>Evidence Reliability (L3)</h2><ul>{ev_rows or '<li>No evidence registered.</li>'}</ul>
         <h2>Pending Agent Notes</h2><ul>{notes_rows or '<li>No pending agent notes.</li>'}</ul>
         <h2>Add User Constraint</h2>
@@ -192,6 +221,39 @@ def create_local_ui_app(
         _require_token(token_q, x_daf_ui_token)
         res = engine.adopt_agent_note_by_user(project_id, decision_id)
         return JSONResponse(status_code=200, content={"ok": True, "data": res})
+
+    @app.post("/projects/{project_id}/sources/{source_id}/bibliography")
+    def ui_set_source_bibliography(
+        project_id: str,
+        source_id: str,
+        csl_json: str = Form(...),
+        token_q: str | None = Query(default=None, alias="token"),
+        x_daf_ui_token: str | None = Header(default=None),
+    ) -> Any:
+        _require_token(token_q, x_daf_ui_token)
+        try:
+            parsed = json.loads(csl_json)
+        except json.JSONDecodeError as exc:
+            return JSONResponse(status_code=422, content={"ok": False, "error": {"code": "INVALID_JSON", "message": str(exc)}})
+        try:
+            res = engine.set_source_bibliography_by_user(project_id, source_id, parsed)
+            return JSONResponse(status_code=200, content={"ok": True, "data": res})
+        except DAFError as exc:
+            return JSONResponse(status_code=400, content=exc.to_dict())
+
+    @app.post("/projects/{project_id}/sources/{source_id}/adopt-bibliography")
+    def ui_adopt_source_bibliography(
+        project_id: str,
+        source_id: str,
+        token_q: str | None = Query(default=None, alias="token"),
+        x_daf_ui_token: str | None = Header(default=None),
+    ) -> Any:
+        _require_token(token_q, x_daf_ui_token)
+        try:
+            res = engine.adopt_source_bibliography_by_user(project_id, source_id)
+            return JSONResponse(status_code=200, content={"ok": True, "data": res})
+        except DAFError as exc:
+            return JSONResponse(status_code=400, content=exc.to_dict())
 
     @app.post("/projects/{project_id}/constraints")
     def ui_add_constraint(

@@ -280,3 +280,27 @@ class SectionNotFoundError(DAFError, KeyError):
     default_code = "SECTION_NOT_FOUND"
     default_retryable = False
     default_recommended_tool = "get_project_status"
+
+
+class StateCorruptedError(DAFError, RuntimeError):
+    """Raised when SQLite state references a missing content blob or inconsistent state."""
+
+    default_code = "STATE_CORRUPTED"
+    default_retryable = False
+    default_recommended_tool = None
+
+
+class BibliographyMissingError(ContractValidationError):
+    """Raised when release is attempted while cited sources lack user-confirmed bibliography."""
+
+    default_code = "BIBLIOGRAPHY_MISSING"
+    default_retryable = False
+    default_recommended_tool = "propose_source_bibliography"
+
+
+class CrossrefUnresolvedError(ContractValidationError):
+    """Raised when release is attempted while cross-references point to undefined labels."""
+
+    default_code = "CROSSREF_UNRESOLVED"
+    default_retryable = True
+    default_recommended_tool = "submit_section"

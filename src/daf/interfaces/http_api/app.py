@@ -13,9 +13,11 @@ from daf.core.engine import DAFEngine
 from daf.core.errors import (
     ApprovalConflictError,
     ArtifactPathInvalidError,
+    BibliographyMissingError,
     ClaimReviewPendingError,
     ContextStaleError,
     ContractValidationError,
+    CrossrefUnresolvedError,
     DAFError,
     EvidenceChangedError,
     IdempotencyKeyConflictError,
@@ -33,6 +35,7 @@ from daf.core.errors import (
     SourceScopeDeniedError,
     SourceSliceNotFoundError,
     SourceSliceStaleError,
+    StateCorruptedError,
     TemplateRenderError,
     UntrustedApprovalChannelError,
 )
@@ -103,13 +106,15 @@ def create_http_app(
             SourceSliceStaleError,
             SourceIndexStaleError,
             PolicyConflictError,
+            BibliographyMissingError,
+            CrossrefUnresolvedError,
         ) as exc:
             return JSONResponse(status_code=409, content=exc.to_dict())
         except SourceSliceNotFoundError as exc:
             return JSONResponse(status_code=404, content=exc.to_dict())
         except ContractValidationError as exc:
             return JSONResponse(status_code=422, content=exc.to_dict())
-        except (TemplateRenderError, PandocUnavailableError, PDFExportError) as exc:
+        except (TemplateRenderError, PandocUnavailableError, PDFExportError, StateCorruptedError) as exc:
             return JSONResponse(status_code=500, content=exc.to_dict())
         except DAFError as exc:
             return JSONResponse(status_code=400, content=exc.to_dict())

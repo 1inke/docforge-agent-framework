@@ -112,6 +112,19 @@ def run_cli_args(argv: list[str] | None = None) -> dict[str, Any]:
     p_snap = subparsers.add_parser("export-snapshot", help="Export a human-readable JSON snapshot of a project on demand.")
     p_snap.add_argument("--project-id", required=True)
 
+    p_doctor = subparsers.add_parser("doctor", help="Verify all state blob references exist in SQLite blobs table.")
+    p_doctor.add_argument("project_id", type=str)
+
+    # Local user source bibliography governance (R1)
+    p_sources = subparsers.add_parser("sources", help="Local user source metadata & bibliography commands.")
+    sources_sub = p_sources.add_subparsers(dest="sources_cmd", required=True)
+    p_src_bib = sources_sub.add_parser("set-bib", help="Confirm official CSL-JSON or BibTeX bibliography for a source.")
+    p_src_bib.add_argument("project_id", type=str)
+    p_src_bib.add_argument("source_id", type=str)
+    bib_grp = p_src_bib.add_mutually_exclusive_group(required=True)
+    bib_grp.add_argument("--csl-json", type=str, help="Path to CSL-JSON file (object or 1-element list) or inline JSON.")
+    bib_grp.add_argument("--bibtex", type=str, help="Path to BibTeX (.bib) file (parsed via Pandoc into CSL-JSON).")
+
     # Generic Agent tool dispatcher
     p_call = subparsers.add_parser("call", help="Invoke any non-privileged DAFEngine Agent tool with a JSON payload.")
     p_call.add_argument("tool_name", type=str)
@@ -176,6 +189,61 @@ def run_cli_args(argv: list[str] | None = None) -> dict[str, Any]:
     if args.command == "export-snapshot":
         snap_path = engine.store.export_snapshot(args.project_id)
         return {"project_id": args.project_id, "snapshot_path": str(snap_path)}
+    if args.command == "doctor":
+        return engine.store.doctor_project(args.project_id)
+    if args.command == "sources":
+        if args.sources_cmd == "set-bib":
+            import subprocess
+            from daf.core.errors import PandocUnavailableError
+            from daf.core.pandoc_ast import find_pandoc_binary
+
+            if args.csl_json:
+                raw_path = Path(args.csl_json)
+                raw_text = (
+                    raw_path.read_text(encoding="utf-8")
+                    if raw_path.is_file()
+                    else (_load_json_arg(args.csl_json) if args.csl_json.startswith("@") else args.csl_json)
+                )
+                parsed = json.loads(raw_text) if isinstance(raw_text, str) else raw_text
+            else:
+                bib_path = Path(args.bibtex)
+                if not bib_path.is_file():
+                    raise FileNotFoundError(f"BibTeX file not found: {bib_path}")
+                pandoc_bin = find_pandoc_binary()
+                if not pandoc_bin:
+                    raise PandocUnavailableError("Pandoc executable is required to parse --bibtex files.")
+                proc = subprocess.run(
+                    [pandoc_bin, "-f", "bibtex", "-t", "csljson", str(bib_path)],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    check=False,
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError(f"Pandoc BibTeX parse failed: {proc.stderr.strip()}")
+                parsed = json.loads(proc.stdout)
+
+            if isinstance(parsed, list):
+                if len(parsed) == 1 and isinstance(parsed[0], dict):
+                    csl_entry = dict(parsed[0])
+                else:
+                    matches = [e for e in parsed if isinstance(e, dict) and e.get("id") == args.source_id]
+                    if len(matches) == 1:
+                        csl_entry = dict(matches[0])
+                    else:
+                        raise ValueError(
+                            f"Expected 1 CSL entry (or one with id=='{args.source_id}'), got {len(parsed)} entries."
+                        )
+            elif isinstance(parsed, dict):
+                csl_entry = dict(parsed)
+            else:
+                raise ValueError("CSL input must decode to a JSON object or 1-element list.")
+
+            return engine.set_source_bibliography_by_user(
+                project_id=args.project_id,
+                source_id=args.source_id,
+                csl_json=csl_entry,
+            )
     if args.command == "call":
         kwargs = _load_json_arg(args.params)
         if not isinstance(kwargs, dict):

@@ -176,6 +176,20 @@ def create_mcp_server(
             idempotency_key=idempotency_key,
         )
 
+    @mcp.tool()
+    def propose_source_bibliography(
+        project_id: str,
+        source_id: str,
+        csl_json: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Propose CSL-JSON bibliographic metadata for an ingested source (pending local user confirmation)."""
+        return _call(
+            "propose_source_bibliography",
+            project_id=project_id,
+            source_id=source_id,
+            csl_json=csl_json,
+        )
+
     # --- Writing (4) ---
     @mcp.tool()
     def submit_outline(

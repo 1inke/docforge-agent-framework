@@ -93,6 +93,7 @@ class ContentProfile(StrictContractModel):
     tone_constraints: list[str] = Field(default_factory=list)
     forbidden_phrases: list[str] = Field(default_factory=list)
     terminology_consistency_required: bool = True
+    extra_physical_units: list[str] = Field(default_factory=list)
 
 
 class SectionRule(StrictContractModel):
@@ -165,6 +166,7 @@ class SourceDocumentRecord(StrictContractModel):
     slice_ids: list[str] = Field(default_factory=list)
     is_agent_generated_summary: bool = False
     bibliography: dict[str, Any] | None = None
+    proposed_bibliography: dict[str, Any] | None = None
 
 
 class TemplateInspectionReport(StrictContractModel):
@@ -714,6 +716,8 @@ class SectionState(StrictContractModel):
     claims: list[str] = Field(default_factory=list)
     source_bindings: list[SourceBinding] = Field(default_factory=list)
     uncited_claim_issues: list[dict[str, Any]] = Field(default_factory=list)
+    defined_labels: list[str] = Field(default_factory=list)
+    crossref_targets: list[str] = Field(default_factory=list)
     unresolved_questions: list[str] = Field(default_factory=list)
     needs_revalidation: bool = False
     stale_reason: str = ""

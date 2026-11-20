@@ -22,6 +22,7 @@ from daf.core.contracts import (
     SemanticReviewReport,
     TaskGuidanceContract,
 )
+from daf.core.pandoc_ast import MIN_RECOMMENDED_PANDOC_VERSION, get_pandoc_version
 from daf.document_profiles.profiles import get_document_profile, list_profile_summaries
 from daf.guidance.templates import SOURCE_SEARCH_MATCH_MODES, TEMPLATES
 
@@ -199,6 +200,9 @@ ERROR_CODE_CATALOG.extend([
         ("SOURCE_IMPORT_CONFIG_INVALID", "get_capabilities", "Import roots must be a JSON array of existing directories."),
         ("SOURCE_IMPORT_PATH_INVALID", None, "Source/template path is invalid, unavailable or changed during safe opening."),
         ("SOURCE_TYPE_UNSUPPORTED", None, "Local source or template file extension is unsupported."),
+        ("BIBLIOGRAPHY_MISSING", "propose_source_bibliography", "Cited source lacks confirmed CSL-JSON bibliography (human must confirm via UI or `daf sources set-bib`)."),
+        ("CROSSREF_UNRESOLVED", "submit_section", "Markdown references an undefined figure/table/equation/section label or contains raw Pandoc cite/attr markup."),
+        ("STATE_CORRUPTED", None, "Project SQLite state references a missing content blob (run `daf doctor <project_id>`)."),
     ]
 ])
 
@@ -271,6 +275,13 @@ TOOL_CATALOG: list[dict[str, Any]] = [
         "mutates_state": True,
         "idempotent": True,
         "description": "Register or update versioned EvidenceItems (L1 excerpt_match_status, L3 source_reliability) with automatic cascade invalidation when evidence changes.",
+    },
+    {
+        "name": "propose_source_bibliography",
+        "category": "evidence",
+        "mutates_state": True,
+        "idempotent": True,
+        "description": "Propose CSL-JSON bibliographic metadata for an ingested source (must be confirmed by local user before release rendering).",
     },
     {
         "name": "get_project_context",
@@ -400,6 +411,15 @@ class CapabilityRegistry:
     @staticmethod
     def detect_environment() -> dict[str, Any]:
         pandoc_path = shutil.which("pandoc")
+        pandoc_ver_tuple = get_pandoc_version() if pandoc_path else None
+        pandoc_version = ".".join(str(x) for x in pandoc_ver_tuple) if pandoc_ver_tuple else None
+        pandoc_version_warning: str | None = None
+        if pandoc_ver_tuple is not None and pandoc_ver_tuple < MIN_RECOMMENDED_PANDOC_VERSION:
+            min_str = ".".join(str(x) for x in MIN_RECOMMENDED_PANDOC_VERSION)
+            pandoc_version_warning = (
+                f"Pandoc {pandoc_version} < {min_str}: caption attributes on ': Caption {{#tbl:id}}' "
+                "are not supported; use '::: {{#tbl:id}}' fenced div blocks instead."
+            )
         word_com_available = False
         if sys.platform == "win32":
             try:
@@ -414,6 +434,8 @@ class CapabilityRegistry:
             "python_version": sys.version.split()[0],
             "pandoc_available": pandoc_path is not None,
             "pandoc_path": pandoc_path,
+            "pandoc_version": pandoc_version,
+            "pandoc_version_warning": pandoc_version_warning,
             "word_com_pdf_available": word_com_available,
             "supported_source_extensions": [".md", ".txt", ".docx", ".pdf"],
             "supported_template_modes": ["builtin", "tagged", "mapped"],
@@ -456,6 +478,7 @@ class CapabilityRegistry:
             "find_sources",
             "read_source_block",
             "register_evidence",
+            "propose_source_bibliography",
             "submit_outline",
             "get_section_context",
             "submit_section",

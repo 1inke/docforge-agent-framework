@@ -49,6 +49,7 @@ from daf.project_store.store import (
 from daf.review_manager.reviewer import ReviewManager
 from daf.workflow_engine.state_machine import (
     WorkflowEngine,
+    _has_valid_bibliography,
     assert_release_ready,
 )
 
@@ -287,6 +288,102 @@ class DAFEngine:
             return res, f"Set evidence '{evidence_id}' reliability to '{reliability}'.", res
 
         return self.store.transact_project(project_id, "set_evidence_reliability_by_user", _mutator)
+
+    def propose_source_bibliography(
+        self,
+        project_id: str,
+        source_id: str,
+        csl_json: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Agent-callable: propose CSL-JSON bibliography metadata for a source (requires human confirmation)."""
+        if not isinstance(csl_json, dict) or not _has_valid_bibliography(csl_json):
+            raise ContractValidationError(
+                "csl_json must be a non-empty CSL-JSON dict with non-empty 'title', 'author', and 'issued'."
+            )
+
+        def _mutator(
+            state: ProjectWorkspaceState, _conn: sqlite3.Connection
+        ) -> tuple[dict[str, Any], str, dict[str, Any]]:
+            doc = state.source_registry.documents.get(source_id)
+            if doc is None:
+                raise ContractValidationError(f"Unknown source_id '{source_id}'.")
+            proposal = dict(csl_json)
+            proposal.setdefault("id", source_id)
+            doc.proposed_bibliography = proposal
+            res = {
+                "project_id": project_id,
+                "source_id": source_id,
+                "proposed_bibliography": doc.proposed_bibliography,
+                "confirmed": False,
+                "message": "Proposal saved; local user confirmation via UI or `daf sources set-bib` is required before release.",
+            }
+            return res, f"Proposed CSL-JSON bibliography for '{source_id}' (pending user confirmation).", res
+
+        return self.store.transact_project(project_id, "propose_source_bibliography", _mutator)
+
+    def set_source_bibliography_by_user(
+        self,
+        project_id: str,
+        source_id: str,
+        csl_json: dict[str, Any],
+        updated_by: str = "local_user",
+    ) -> dict[str, Any]:
+        """Local user-only: confirm authoritative CSL-JSON bibliography metadata for a source."""
+        if not isinstance(csl_json, dict) or not _has_valid_bibliography(csl_json):
+            raise ContractValidationError(
+                "csl_json must be a non-empty CSL-JSON dict with non-empty 'title', 'author', and 'issued'."
+            )
+
+        def _mutator(
+            state: ProjectWorkspaceState, _conn: sqlite3.Connection
+        ) -> tuple[dict[str, Any], str, dict[str, Any]]:
+            doc = state.source_registry.documents.get(source_id)
+            if doc is None:
+                raise ContractValidationError(f"Unknown source_id '{source_id}'.")
+            confirmed = dict(csl_json)
+            confirmed["id"] = source_id
+            doc.bibliography = confirmed
+            res = {
+                "project_id": project_id,
+                "source_id": source_id,
+                "bibliography": doc.bibliography,
+                "updated_by": updated_by,
+            }
+            return res, f"Confirmed CSL-JSON bibliography for '{source_id}' by {updated_by}.", res
+
+        return self.store.transact_project(project_id, "set_source_bibliography_by_user", _mutator)
+
+    def adopt_source_bibliography_by_user(
+        self,
+        project_id: str,
+        source_id: str,
+        updated_by: str = "local_user",
+    ) -> dict[str, Any]:
+        """Local user-only: promote agent-proposed CSL-JSON bibliography to confirmed bibliography."""
+
+        def _mutator(
+            state: ProjectWorkspaceState, _conn: sqlite3.Connection
+        ) -> tuple[dict[str, Any], str, dict[str, Any]]:
+            doc = state.source_registry.documents.get(source_id)
+            if doc is None:
+                raise ContractValidationError(f"Unknown source_id '{source_id}'.")
+            if not _has_valid_bibliography(doc.proposed_bibliography):
+                raise ContractValidationError(
+                    f"Source '{source_id}' has no valid proposed_bibliography to adopt."
+                )
+            confirmed = dict(doc.proposed_bibliography or {})
+            confirmed["id"] = source_id
+            doc.bibliography = confirmed
+            res = {
+                "project_id": project_id,
+                "source_id": source_id,
+                "bibliography": doc.bibliography,
+                "adopted_from_proposal": True,
+                "updated_by": updated_by,
+            }
+            return res, f"Adopted proposed bibliography for '{source_id}' by {updated_by}.", res
+
+        return self.store.transact_project(project_id, "adopt_source_bibliography_by_user", _mutator)
 
     # 4. ingest_sources
     def ingest_sources(
@@ -1595,6 +1692,14 @@ class DAFEngine:
         if tool_name in {"set_source_policy_by_user", "update_source_policy", "set_source_policy"}:
             raise SourcePolicyChangeRequiresHumanError("Agent cannot modify source policy directly; ask the user via local UI or CLI.")
         if tool_name in {
+            "set_source_bibliography_by_user",
+            "adopt_source_bibliography_by_user",
+            "set_source_bibliography",
+        }:
+            raise SourcePolicyChangeRequiresHumanError(
+                "Agent cannot confirm source bibliography directly; call 'propose_source_bibliography' and ask the local user to confirm via local UI or `daf sources set-bib`."
+            )
+        if tool_name in {
             "decide_approval_by_human",
             "confirm_approval",
         }:
@@ -1617,6 +1722,7 @@ class DAFEngine:
             "get_source_block": self.get_source_block,
             "search_sources": self.search_sources,
             "register_evidence": self.register_evidence,
+            "propose_source_bibliography": self.propose_source_bibliography,
             "get_project_context": self.get_project_context,
             "submit_outline": self.submit_outline,
             "get_section_context": self.get_section_context,
