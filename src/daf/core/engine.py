@@ -51,6 +51,7 @@ from daf.workflow_engine.state_machine import (
     WorkflowEngine,
     _has_valid_bibliography,
     assert_release_ready,
+    effective_section_ids,
 )
 
 
@@ -186,7 +187,7 @@ class DAFEngine:
             before = SourcePolicyEvaluator.allowed_ids(state, "cite")
             validated.revision = SourcePolicyEvaluator.revision(state) + 1
             validated.updated_by = updated_by
-            validated.approved_at = now
+            validated.confirmed_at = now
             validated.reason = reason.strip() or "Updated by local user"
             state.source_policy = validated
             revoked = before - SourcePolicyEvaluator.allowed_ids(state, "cite")
@@ -453,7 +454,7 @@ class DAFEngine:
 
         return self.store.transact_project(project_id, "ingest_sources", _mutator)
 
-    # 4b. register_evidence (R2-P0-03 versioned evidence + cascade invalidation)
+    # 4b. register_evidence (versioned evidence + cascade invalidation)
     def register_evidence(
         self,
         project_id: str,
@@ -504,7 +505,7 @@ class DAFEngine:
             request_payload={"project_id": project_id, "evidence_items": evidence_items},
         )
 
-    # 4c. list_source_blocks (R3-04 §1.2A)
+    # 4c. list_source_blocks
     def list_source_blocks(
         self,
         project_id: str,
@@ -520,7 +521,7 @@ class DAFEngine:
             cursor=cursor,
         )
 
-    # 4d. get_source_block (R3-04 §1.2B)
+    # 4d. get_source_block
     def get_source_block(
         self,
         project_id: str,
@@ -538,7 +539,7 @@ class DAFEngine:
             expected_sha256=expected_sha256,
         )
 
-    # 4e. search_sources (R3-04 §1.2C)
+    # 4e. search_sources
     def search_sources(
         self,
         project_id: str,
@@ -558,7 +559,7 @@ class DAFEngine:
             match_mode=match_mode,
         )
 
-    # 5. get_project_context (R3-02 & R3-05)
+    # 5. get_project_context
     def get_project_context(
         self,
         project_id: str,
@@ -612,7 +613,7 @@ class DAFEngine:
             hydrate_slices=False,
         )
 
-    # 7. get_section_context (R3-03 & R3-05)
+    # 7. get_section_context
     def get_section_context(
         self,
         project_id: str,
@@ -631,7 +632,7 @@ class DAFEngine:
         )
         return ctx.model_dump(mode="json")
 
-    # 7b. get_section_content (R3-02 §3.2 controlled section content reader)
+    # 7b. get_section_content (controlled section content reader)
     def get_section_content(
         self,
         project_id: str,
@@ -656,11 +657,13 @@ class DAFEngine:
         *,
         simulate_mid_transaction_crash: bool = False,
     ) -> dict[str, Any]:
-        sub_obj = (
-            submission
-            if isinstance(submission, SectionSubmissionContract)
-            else SectionSubmissionContract.model_validate(submission)
-        )
+        if isinstance(submission, SectionSubmissionContract):
+            sub_obj = submission
+        else:
+            try:
+                sub_obj = SectionSubmissionContract.model_validate(submission)
+            except ValueError as exc:
+                raise ContractValidationError(f"Invalid SectionSubmissionContract: {exc}") from exc
         project_id = validate_safe_identifier(sub_obj.project_id, "project_id")
         semantic_payload = sub_obj.model_dump(mode="json")
 
@@ -680,7 +683,7 @@ class DAFEngine:
             simulate_mid_transaction_crash=simulate_mid_transaction_crash,
         )
 
-    # 9. review_document (R2-P0-02 deterministic checks + creates pending SemanticReviewTasks)
+    # 9. review_document (deterministic checks + creates pending SemanticReviewTasks)
     def review_document(
         self,
         project_id: str,
@@ -705,7 +708,7 @@ class DAFEngine:
 
         return self.store.transact_project(project_id, "review_document", _mutator)
 
-    # 9b. list_semantic_review_tasks (R2-P0-02)
+    # 9b. list_semantic_review_tasks
     def list_semantic_review_tasks(
         self,
         project_id: str,
@@ -714,15 +717,21 @@ class DAFEngine:
         state = self.store.load_state(project_id)
         return ReviewManager.list_semantic_review_tasks(state, status=status)
 
-    # 9c. claim_semantic_review_task (R2-P0-02)
+    # 9c. claim_semantic_review_task
     def claim_semantic_review_task(
         self,
         project_id: str,
         task_id: str,
-        agent_session_id: str = "external-agent",
+        agent_session_id: str | None = None,
         reviewer_id: str | None = None,
     ) -> dict[str, Any]:
-        effective_agent = reviewer_id or agent_session_id
+        effective_agent = (reviewer_id or agent_session_id or "").strip()
+        if len(effective_agent) < 3:
+            raise ContractValidationError(
+                "reviewer_id / agent_session_id is required (>= 3 non-whitespace characters).",
+                code="REVIEWER_ID_REQUIRED",
+                details={"task_id": task_id},
+            )
 
         def _mutator(
             state: ProjectWorkspaceState, _conn: sqlite3.Connection
@@ -736,7 +745,7 @@ class DAFEngine:
 
         return self.store.transact_project(project_id, "claim_semantic_review_task", _mutator)
 
-    # 9d. submit_semantic_review (R2-P0-02, R2-P1-06 & R3-01)
+    # 9d. submit_semantic_review
     def submit_semantic_review(
         self,
         project_id: str,
@@ -745,7 +754,7 @@ class DAFEngine:
         context_fingerprint: str,
         findings: list[dict[str, Any]] | None = None,
         review_summary: str = "",
-        reviewer_agent: str = "external-agent",
+        reviewer_agent: str | None = None,
         reviewed_by: str | None = None,
         recommendation: str | None = None,
         claim_evaluations: list[dict[str, Any]] | None = None,
@@ -754,7 +763,13 @@ class DAFEngine:
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Submit a structured semantic review report; valid approving reports are accepted immediately."""
-        effective_reviewer = reviewed_by or reviewer_agent
+        effective_reviewer = (reviewed_by or reviewer_agent or "").strip()
+        if len(effective_reviewer) < 3:
+            raise ContractValidationError(
+                "reviewer_id / reviewed_by is required (>= 3 non-whitespace characters).",
+                code="REVIEWER_ID_REQUIRED",
+                details={"task_id": task_id},
+            )
 
         def _mutator(
             state: ProjectWorkspaceState, _conn: sqlite3.Connection
@@ -963,7 +978,9 @@ class DAFEngine:
                     }
                 )
             detail["sections"] = section_diffs
-            detail["last_rendered_docx_path"] = state.last_rendered_docx_path
+            detail["last_artifact_path"] = (
+                state.last_render_manifest.artifact_path if state.last_render_manifest else None
+            )
         return detail
 
     # 12a. request_approval (idempotent & deduplicated by artifact_hash)
@@ -1076,12 +1093,7 @@ class DAFEngine:
             )
         }
         node_map = {n.section_id: n for n in state.outline_graph.nodes}
-        # P1-2: Outline nodes are the canonical section list once planned; fall back to profile rules before outline
-        ordered_ids = (
-            [n.section_id for n in state.outline_graph.nodes]
-            if state.outline_graph.nodes
-            else list(rules_by_id.keys())
-        )
+        ordered_ids = effective_section_ids(state)
         sections_status: list[dict[str, Any]] = []
         for sid in ordered_ids:
             req = rules_by_id.get(sid)
@@ -1111,7 +1123,7 @@ class DAFEngine:
             if j.phase in {"prepared", "built", "promoted"}
         ]
 
-        # P1-2: Single source of truth for next_action via state_resolver
+        # Single source of truth for next_action via state_resolver
         if not state.source_registry.documents:
             resolution = resolve_task_state(state, "source_analysis", None)
         elif state.outline_graph.outline_revision == 0 or (
@@ -1167,13 +1179,15 @@ class DAFEngine:
                 if state.last_render_manifest
                 else None
             ),
-            "last_rendered_docx_path": state.last_rendered_docx_path,
+            "last_artifact_path": (
+                state.last_render_manifest.artifact_path if state.last_render_manifest else None
+            ),
             "last_exported_pdf_path": state.last_exported_pdf_path,
             "next_action": next_action,
             "recommended_next_actions": next_actions,
         }
 
-    # 14a. recover_render_jobs (P1-4: lease- & PID-aware crash recovery only)
+    # 14a. recover_render_jobs (lease- & PID-aware crash recovery only)
     def recover_render_jobs(self, project_id: str) -> dict[str, Any]:
         """Recover only incomplete RenderJobs whose lease has expired AND whose owner PID is no longer alive."""
         now = datetime.now(timezone.utc)
@@ -1201,10 +1215,10 @@ class DAFEngine:
         ) -> tuple[dict[str, Any], str, dict[str, Any]]:
             committed_paths: set[str] = set()
             if state.last_render_manifest and state.last_render_manifest.artifact_status == "committed":
-                committed_paths.add(str(Path(state.last_render_manifest.docx_path).resolve()))
+                committed_paths.add(str(Path(state.last_render_manifest.artifact_path).resolve()))
             for hist_m in state.render_history:
                 if hist_m.artifact_status in {"committed", "superseded"}:
-                    committed_paths.add(str(Path(hist_m.docx_path).resolve()))
+                    committed_paths.add(str(Path(hist_m.artifact_path).resolve()))
 
             recovered: list[str] = []
             now_iso = datetime.now(timezone.utc).isoformat()
@@ -1236,7 +1250,7 @@ class DAFEngine:
             project_id, "recover_render_jobs", _mutator, hydrate_slices=False, hydrate_sections=False
         )
 
-    # 14. render_document (R2-P1-05 two-phase Prepare -> Build (out-of-tx) -> Revalidate & Finalize)
+    # 14. render_document ( two-phase Prepare -> Build (out-of-tx) -> Revalidate & Finalize)
     def render_document(
         self,
         project_id: str,
@@ -1324,7 +1338,7 @@ class DAFEngine:
         job_id: str = prepared_holder["job_id"]
         render_id: str = prepared_holder["render_id"]
 
-        # Phase 2 & 3: Build & Promote OUTSIDE SQLite write transaction (R2-P1-05 §5.3 & T-R2-ART-04)
+        # Phase 2 & 3: Build & Promote OUTSIDE SQLite write transaction
         try:
             build_res = DocumentEngine.render_document(
                 state=state_snapshot,
@@ -1341,7 +1355,7 @@ class DAFEngine:
                 simulate_crash_before_finalize=simulate_crash_before_finalize,
             )
         except Exception as exc:
-            # If simulated crash after promotion, leave job in 'promoted' state so recover_render_jobs can test recovery (T-R2-ART-03)
+            # If simulated crash after promotion, leave job in 'promoted' state so recover_render_jobs can test recovery
             if not simulate_crash_before_finalize:
                 error_message = str(exc)
                 try:
@@ -1374,7 +1388,7 @@ class DAFEngine:
                 section_mapping=section_mapping,
                 degradation_mode=eff_degradation,
             )
-            promoted_file = Path(build_res["docx_path"])
+            promoted_file = Path(build_res["artifact_path"])
             if live_fp["input_fingerprint"] != build_res["input_fingerprint"]:
                 if job_id in state.render_jobs:
                     state.render_jobs[job_id].phase = "stale"
@@ -1401,7 +1415,7 @@ class DAFEngine:
                     f"Promoted DOCX file missing at '{promoted_file}' before finalize."
                 )
             actual_sha = _sha256_file(promoted_file)
-            if actual_sha != build_res["docx_sha256"]:
+            if actual_sha != build_res["artifact_sha256"]:
                 raise RenderStaleError(
                     "Promoted DOCX SHA-256 mismatch during finalize."
                 )
@@ -1414,10 +1428,9 @@ class DAFEngine:
                 state.render_history.append(state.last_render_manifest)
 
             state.last_render_manifest = manifest
-            state.last_rendered_docx_path = str(promoted_file)
             if job_id in state.render_jobs:
                 state.render_jobs[job_id].phase = "committed"
-                state.render_jobs[job_id].output_sha256 = f"sha256:{actual_sha}"
+                state.render_jobs[job_id].artifact_sha256 = f"sha256:{actual_sha}"
                 state.render_jobs[job_id].updated_at = datetime.now(timezone.utc).isoformat()
 
             if purpose == "release":
@@ -1425,7 +1438,7 @@ class DAFEngine:
 
             summary = (
                 f"Finalized DOCX render (purpose={purpose}, mode={build_res['template_mode']}, "
-                f"render_id={render_id}, job_id={job_id}) to '{build_res['docx_path']}'."
+                f"render_id={render_id}, job_id={job_id}) to '{build_res['artifact_path']}'."
             )
             return build_res, summary, build_res
 
@@ -1434,7 +1447,7 @@ class DAFEngine:
             raise stale_error_holder[0]
         return fin_res
 
-    # 15. export_document (DAF-P0-02, DAF-P0-04, DAF-P1-05 & R2-P1-05)
+    # 15. export_document
     def export_document(
         self,
         project_id: str,
@@ -1474,14 +1487,14 @@ class DAFEngine:
                 stale_reasons.append(
                     f"Manifest input_fingerprint ({manifest.input_fingerprint[:18]}) does not match current project snapshot ({live_fp['input_fingerprint'][:18]})."
                 )
-            docx_file = Path(manifest.docx_path)
-            if not docx_file.exists():
-                stale_reasons.append(f"Rendered DOCX file does not exist at '{docx_file}'.")
+            art_file = Path(manifest.artifact_path)
+            if not art_file.exists():
+                stale_reasons.append(f"Rendered DOCX file does not exist at '{art_file}'.")
             else:
-                actual_sha = f"sha256:{_sha256_file(docx_file)}"
-                if actual_sha != manifest.docx_sha256:
+                actual_sha = f"sha256:{_sha256_file(art_file)}"
+                if actual_sha != manifest.artifact_sha256:
                     stale_reasons.append(
-                        f"On-disk DOCX SHA-256 ({actual_sha[:18]}) does not match RenderManifest docx_sha256 ({manifest.docx_sha256[:18]})."
+                        f"On-disk DOCX SHA-256 ({actual_sha[:18]}) does not match RenderManifest artifact_sha256 ({manifest.artifact_sha256[:18]})."
                     )
 
         rerendered = False
@@ -1508,20 +1521,20 @@ class DAFEngine:
         state_post_render = self.store.load_state(project_id)
         manifest = state_post_render.last_render_manifest
         assert manifest is not None and manifest.artifact_status == "committed"
-        docx_path = Path(manifest.docx_path)
-        verified_docx_sha = _sha256_file(docx_path)
-        if f"sha256:{verified_docx_sha}" != manifest.docx_sha256:
+        art_path = Path(manifest.artifact_path)
+        verified_art_sha = _sha256_file(art_path)
+        if f"sha256:{verified_art_sha}" != manifest.artifact_sha256:
             raise RenderStaleError(
                 "On-disk DOCX SHA-256 mismatch before export.",
-                details={"docx_path": str(docx_path)},
+                details={"artifact_path": str(art_path)},
             )
 
-        # Run PDF export outside SQLite write transaction if requested (T-R2-ART-06)
+        # Run PDF export outside SQLite write transaction if requested
         pdf_info: dict[str, Any] | None = None
         if export_pdf:
-            pdf_target = artifacts_dir / f"{docx_path.stem}.pdf"
-            pdf_info = DocumentEngine.export_pdf_via_word_com(docx_path, pdf_target)
-            if pdf_info.get("source_docx_sha256") != verified_docx_sha:
+            pdf_target = artifacts_dir / f"{art_path.stem}.pdf"
+            pdf_info = DocumentEngine.export_pdf_via_word_com(art_path, pdf_target)
+            if pdf_info.get("source_docx_sha256") != verified_art_sha:
                 raise RenderStaleError(
                     "PDF export source_docx_sha256 does not match committed RenderManifest DOCX SHA-256."
                 )
@@ -1560,7 +1573,7 @@ class DAFEngine:
                             "rule_check_status": b.rule_check_status,
                             "semantic_support_status": b.semantic_support_status,
                             "support_status": b.support_status,
-                            "support_rationale": b.support_rationale,
+                            "rationale": b.rationale,
                             "reviewer": b.reviewer,
                             "reviewed_against_revision": b.reviewed_against_revision,
                             "reviewed_against_section_hash": b.reviewed_against_section_hash,
@@ -1572,7 +1585,6 @@ class DAFEngine:
                             "evidence_quote_hash": b.evidence_quote_hash,
                             "quote_excerpt": ev.quote_excerpt if ev else "",
                             "excerpt_match_status": ev.excerpt_match_status if ev else "not_applicable",
-                            "verification_status": ev.verification_status if ev else "not_applicable",
                             "source_reliability": ev.source_reliability if ev else "not_applicable",
                             "source_id": ev.source_id if ev else "",
                             "source_file_name": src_doc.file_name if src_doc else "",
@@ -1594,8 +1606,8 @@ class DAFEngine:
                 "render_manifest": cur_manifest.model_dump(mode="json"),
                 "rerendered_during_export": rerendered,
                 "rerender_reasons": stale_reasons,
-                "docx_path": str(docx_path),
-                "source_docx_sha256": verified_docx_sha,
+                "artifact_path": str(art_path),
+                "artifact_sha256": verified_art_sha,
                 "pdf_export": pdf_info,
                 "approvals": {k: v.model_dump(mode="json") for k, v in state.approvals.items()},
                 "evidence_traceability_matrix": evidence_matrix,
@@ -1615,8 +1627,8 @@ class DAFEngine:
                 "purpose": purpose,
                 "is_official_release": purpose == "release",
                 "stage": state.stage,
-                "docx_path": str(docx_path),
-                "source_docx_sha256": verified_docx_sha,
+                "artifact_path": str(art_path),
+                "artifact_sha256": verified_art_sha,
                 "render_id": cur_manifest.render_id,
                 "input_fingerprint": cur_manifest.input_fingerprint,
                 "rerendered_during_export": rerendered,
@@ -1634,8 +1646,8 @@ class DAFEngine:
 
         return self.store.transact_project(project_id, "export_document", _export_mutator)
 
-    # Unified Agent Tool Dispatcher (enforces non-privileged Agent domain boundary, R2-P0-01)
-    # Unified compact helpers for streamlined MCP tool surface (P2-A)
+    # Unified Agent Tool Dispatcher (enforces non-privileged Agent domain boundary)
+    # Unified compact helpers for streamlined MCP tool surface
     def find_sources(
         self,
         project_id: str,
@@ -1667,9 +1679,16 @@ class DAFEngine:
         self,
         project_id: str,
         target_section_ids: list[str] | None = None,
-        reviewer_id: str = "reviewer_agent",
+        reviewer_id: str | None = None,
     ) -> dict[str, Any]:
         """Run deterministic QA, create semantic review tasks, and claim them in one call."""
+        eff_reviewer = (reviewer_id or "").strip()
+        if len(eff_reviewer) < 3:
+            raise ContractValidationError(
+                "reviewer_id is required (>= 3 non-whitespace characters) for start_review.",
+                code="REVIEWER_ID_REQUIRED",
+                details={"project_id": project_id},
+            )
         rev_out = self.review_document(project_id=project_id, target_section_ids=target_section_ids)
         claimed_tasks: list[dict[str, Any]] = []
         for t in rev_out.get("semantic_review_tasks", []):
@@ -1678,7 +1697,7 @@ class DAFEngine:
                     self.claim_semantic_review_task(
                         project_id=project_id,
                         task_id=t["task_id"],
-                        reviewer_id=reviewer_id,
+                        reviewer_id=eff_reviewer,
                     )
                 )
         rev_out["claimed_tasks"] = claimed_tasks

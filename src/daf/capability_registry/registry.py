@@ -1,4 +1,4 @@
-"""Capability Registry for DocForge Agent Framework (DAF §3.1, §5.1 & Remediation R2 v1.0)."""
+"""Capability Registry for DocForge Agent Framework (DAF §3.1, §5.1)."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from daf.core.pandoc_ast import MIN_RECOMMENDED_PANDOC_VERSION, get_pandoc_versi
 from daf.document_profiles.profiles import get_document_profile, list_profile_summaries
 from daf.guidance.templates import SOURCE_SEARCH_MATCH_MODES, TEMPLATES
 
-PROTOCOL_VERSION = "1.4"
+PROTOCOL_VERSION = "2.0"
 
 ERROR_CODE_CATALOG: list[dict[str, Any]] = [
     {
@@ -203,6 +203,9 @@ ERROR_CODE_CATALOG.extend([
         ("BIBLIOGRAPHY_MISSING", "propose_source_bibliography", "Cited source lacks confirmed CSL-JSON bibliography (human must confirm via UI or `daf sources set-bib`)."),
         ("CROSSREF_UNRESOLVED", "submit_section", "Markdown references an undefined figure/table/equation/section label or contains raw Pandoc cite/attr markup."),
         ("STATE_CORRUPTED", None, "Project SQLite state references a missing content blob (run `daf doctor <project_id>`)."),
+        ("SECTION_NOT_IN_OUTLINE", "get_project_status", "Submitted section_id is not declared in the approved OutlineGraph."),
+        ("REVIEWER_ID_REQUIRED", "start_review", "A distinct reviewer_id / reviewed_by (>= 3 characters) is required for semantic review."),
+        ("REVIEWER_IS_AUTHOR", "claim_semantic_review_task", "The reviewer session cannot be empty or identical to the section's author_session."),
     ]
 ])
 

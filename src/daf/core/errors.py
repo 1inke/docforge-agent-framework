@@ -81,14 +81,14 @@ class SecurityBoundaryError(DAFError, ValueError):
 
 
 class ArtifactPathInvalidError(SecurityBoundaryError):
-    """Raised when an output filename or artifact path attempts traversal or invalid syntax (R2-P1-05)."""
+    """Raised when an output filename or artifact path attempts traversal or invalid syntax."""
 
     default_code = "ARTIFACT_PATH_INVALID"
     default_retryable = False
 
 
 class ProjectAlreadyExistsError(DAFError, ValueError):
-    """Raised when create_project is called with an already-existing project_id (R2-P1-04)."""
+    """Raised when create_project is called with an already-existing project_id."""
 
     default_code = "PROJECT_ALREADY_EXISTS"
     default_retryable = False
@@ -111,7 +111,7 @@ class RevisionConflictError(DAFError, ValueError):
 
 
 class ContextStaleError(DAFError, ValueError):
-    """Raised when submission.context_revision does not match current section dependency fingerprint (DAF-P0-01)."""
+    """Raised when submission.context_revision does not match current section dependency fingerprint."""
 
     default_code = "CONTEXT_STALE"
     default_retryable = True
@@ -119,14 +119,14 @@ class ContextStaleError(DAFError, ValueError):
 
 
 class IdempotencyKeyConflictError(DAFError, ValueError):
-    """Raised when the same idempotency_key is reused with a different request payload (DAF-P0-03)."""
+    """Raised when the same idempotency_key is reused with a different request payload."""
 
     default_code = "IDEMPOTENCY_KEY_REUSED"
     default_retryable = False
 
 
 class ApprovalConflictError(DAFError, ValueError):
-    """Raised when an approval gate is missing, stale, or lacks verifiable human confirmation (DAF-P0-02 & R2-P0-01)."""
+    """Raised when an approval gate is missing, stale, or lacks verifiable human confirmation."""
 
     default_code = "APPROVAL_REQUIRED"
     default_retryable = True
@@ -134,7 +134,7 @@ class ApprovalConflictError(DAFError, ValueError):
 
 
 class UntrustedApprovalChannelError(ApprovalConflictError):
-    """Raised when an Agent attempts to mint or consume human approval tokens or invoke trusted confirmation channels (R2-P0-01)."""
+    """Raised when an Agent attempts to mint or consume human approval tokens or invoke trusted confirmation channels."""
 
     default_code = "UNTRUSTED_APPROVAL_CHANNEL"
     default_retryable = False
@@ -142,7 +142,7 @@ class UntrustedApprovalChannelError(ApprovalConflictError):
 
 
 class SemanticReviewRequiredError(ApprovalConflictError):
-    """Raised when release or approval is attempted without an accepted semantic review for the current revision (R2-P0-02)."""
+    """Raised when release or approval is attempted without an accepted semantic review for the current revision."""
 
     default_code = "SEMANTIC_REVIEW_REQUIRED"
     default_retryable = True
@@ -150,7 +150,7 @@ class SemanticReviewRequiredError(ApprovalConflictError):
 
 
 class SemanticReviewStaleError(ApprovalConflictError):
-    """Raised when an existing semantic review is stale relative to section, evidence, or constraint changes (R2-P0-02)."""
+    """Raised when an existing semantic review is stale relative to section, evidence, or constraint changes."""
 
     default_code = "SEMANTIC_REVIEW_STALE"
     default_retryable = True
@@ -158,7 +158,7 @@ class SemanticReviewStaleError(ApprovalConflictError):
 
 
 class ClaimReviewPendingError(ApprovalConflictError):
-    """Raised when factual claims have passed L2a rules but lack accepted L2b semantic support review (R2-P1-06)."""
+    """Raised when factual claims have passed L2a rules but lack accepted L2b semantic support review."""
 
     default_code = "CLAIM_REVIEW_PENDING"
     default_retryable = True
@@ -166,7 +166,7 @@ class ClaimReviewPendingError(ApprovalConflictError):
 
 
 class EvidenceChangedError(ApprovalConflictError):
-    """Raised when bound evidence revision, fingerprint, or quote_hash changed after a claim or section was reviewed (R2-P0-03)."""
+    """Raised when bound evidence revision, fingerprint, or quote_hash changed after a claim or section was reviewed."""
 
     default_code = "EVIDENCE_CHANGED"
     default_retryable = True
@@ -174,7 +174,7 @@ class EvidenceChangedError(ApprovalConflictError):
 
 
 class RenderStaleError(DAFError, RuntimeError):
-    """Raised when an existing rendered artifact does not match the current RenderManifest fingerprint (DAF-P0-04)."""
+    """Raised when an existing rendered artifact does not match the current RenderManifest fingerprint."""
 
     default_code = "RENDER_STALE"
     default_retryable = True
@@ -182,14 +182,14 @@ class RenderStaleError(DAFError, RuntimeError):
 
 
 class TemplateRenderError(DAFError, RuntimeError):
-    """Raised when template rendering fails or mapped anchors are invalid/ambiguous (DAF-P1-06)."""
+    """Raised when template rendering fails or mapped anchors are invalid/ambiguous."""
 
     default_code = "TEMPLATE_MAPPING_INVALID"
     default_retryable = False
 
 
 class PandocUnavailableError(TemplateRenderError):
-    """Raised when native OMML equation rendering requires Pandoc in strict mode (DAF-P1-06)."""
+    """Raised when native OMML equation rendering requires Pandoc in strict mode."""
 
     default_code = "RENDER_DEPENDENCY_MISSING"
     default_retryable = False
@@ -203,7 +203,7 @@ class PDFExportError(DAFError, RuntimeError):
 
 
 class SourceSliceNotFoundError(ContractValidationError, KeyError):
-    """Raised when a requested source_id or slice_id does not exist in the current project (R3-04 §6.2)."""
+    """Raised when a requested source_id or slice_id does not exist in the current project."""
 
     default_code = "SOURCE_SLICE_NOT_FOUND"
     default_retryable = False
@@ -211,7 +211,7 @@ class SourceSliceNotFoundError(ContractValidationError, KeyError):
 
 
 class SourceSliceStaleError(ContextStaleError):
-    """Raised when caller's expected_sha256 does not match the current slice SHA-256 (R3-04 §6.2)."""
+    """Raised when caller's expected_sha256 does not match the current slice SHA-256."""
 
     default_code = "SOURCE_SLICE_STALE"
     default_retryable = True
@@ -219,7 +219,7 @@ class SourceSliceStaleError(ContextStaleError):
 
 
 class SourceIndexStaleError(ContextStaleError):
-    """Raised when a pagination cursor's source index revision is outdated after source re-ingestion (R3-04 §6.2)."""
+    """Raised when a pagination cursor's source index revision is outdated after source re-ingestion."""
 
     default_code = "SOURCE_INDEX_STALE"
     default_retryable = True
@@ -227,7 +227,7 @@ class SourceIndexStaleError(ContextStaleError):
 
 
 class SourceQueryInvalidError(ContractValidationError):
-    """Raised when source search query, window offsets, cursor, or pagination parameters are invalid (R3-04 §6.2)."""
+    """Raised when source search query, window offsets, cursor, or pagination parameters are invalid."""
 
     default_code = "SOURCE_QUERY_INVALID"
     default_retryable = True
@@ -235,7 +235,7 @@ class SourceQueryInvalidError(ContractValidationError):
 
 
 class UnsupportedTaskTypeError(ContractValidationError):
-    """Raised when get_project_context is called with an unsupported task_type (R3-02 §6.2)."""
+    """Raised when get_project_context is called with an unsupported task_type."""
 
     default_code = "UNSUPPORTED_TASK_TYPE"
     default_retryable = False
@@ -243,7 +243,7 @@ class UnsupportedTaskTypeError(ContractValidationError):
 
 
 class WordBudgetInvalidError(ContractValidationError):
-    """Raised when a section's effective word budget has invalid min_words/max_words bounds (R3-03 §6.2)."""
+    """Raised when a section's effective word budget has invalid min_words/max_words bounds."""
 
     default_code = "WORD_BUDGET_INVALID"
     default_retryable = True
@@ -251,7 +251,7 @@ class WordBudgetInvalidError(ContractValidationError):
 
 
 class ContextBudgetExceededError(ContractValidationError):
-    """Raised when core required context fields exceed requested max_context_chars or budget args conflict (R3-05 §6.2)."""
+    """Raised when core required context fields exceed requested max_context_chars or budget args conflict."""
 
     default_code = "CONTEXT_BUDGET_EXCEEDED"
     default_retryable = True

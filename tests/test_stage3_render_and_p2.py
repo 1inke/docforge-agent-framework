@@ -120,7 +120,7 @@ sections:
                 "context_revision": ctx["context_revision"],
                 "context_fingerprint": ctx["context_fingerprint"],
                 "idempotency_key": f"k-{sid}",
-                "author_session": "w1",
+                "author_session": "writer-01",
                 "content_markdown": md,
                 "summary": f"Draft {sid}",
             }

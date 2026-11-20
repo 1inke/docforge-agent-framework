@@ -1,4 +1,4 @@
-"""Hybrid Review Manager: Deterministic Rule QA (L1/L2a) + Stateful Agent Semantic Review Lifecycle (L2b) (DAF §3.5, §5.5, R2-P0-02 & R2-P1-06)."""
+"""Hybrid Review Manager: Deterministic Rule QA (L1/L2a) + Stateful Agent Semantic Review Lifecycle (L2b)."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from daf.context_manager.manager import (
     JINJA_TAG_PATTERN,
     ContextManager,
     evaluate_claim_binding_support,
+    normalize_for_verification,
     record_semantic_support_review,
     resolve_section_word_budget,
     run_claim_rule_checks,
@@ -30,8 +31,9 @@ from daf.core.errors import (
     SemanticReviewRequiredError,
     SemanticReviewStaleError,
 )
+from daf.core.pandoc_ast import analyze_markdown_with_pandoc
 from daf.guidance.policy import SourcePolicyEvaluator
-from daf.workflow_engine.state_machine import count_effective_words
+from daf.workflow_engine.state_machine import count_effective_words, effective_section_ids
 
 UNBALANCED_LATEX_INLINE = re.compile(r"(?<!\\)\$")
 
@@ -43,7 +45,7 @@ DEFAULT_FALLBACK_CHECKLIST: list[str] = [
 
 
 class ReviewManager:
-    """Executes deterministic QA rules (L1/L2a) and manages the pending -> claimed -> submitted -> accepted semantic review lifecycle (R2-P0-02, R2-P1-06 & R3-01/03)."""
+    """Executes deterministic QA rules (L1/L2a) and manages the pending -> claimed -> submitted -> accepted semantic review lifecycle (/03)."""
 
     @staticmethod
     def _effective_checklist_for_section(state: ProjectWorkspaceState, sec_id: str) -> list[str]:
@@ -70,7 +72,7 @@ class ReviewManager:
         for task in state.review_ledger.semantic_review_tasks:
             if task.status in {"stale", "expired", "rejected"}:
                 continue
-            sec_id = task.section_id or (task.target_section_ids[0] if task.target_section_ids else "")
+            sec_id = task.section_id
             if not sec_id:
                 continue
             sec_state = state.section_versions.sections.get(sec_id)
@@ -82,7 +84,8 @@ class ReviewManager:
 
             _, current_fp, _ = ContextManager.compute_section_dependency_snapshot(state, sec_id)
             expected_questions = cls._effective_checklist_for_section(state, sec_id)
-            checklist_changed = bool(task.checklist_questions and task.checklist_questions != expected_questions)
+            task_questions = [c.question for c in task.checklist_items]
+            checklist_changed = bool(task_questions and task_questions != expected_questions)
             if (
                 task.target_section_revision != sec_state.revision
                 or (task.target_section_content_hash and task.target_section_content_hash != sec_state.content_hash)
@@ -114,11 +117,11 @@ class ReviewManager:
         agent_semantic_issues: list[dict[str, Any] | ReviewIssue] | None = None,
         claim_support_assessments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Run deterministic QA checks (L1 + L2a) and create/preserve `pending` SemanticReviewTasks (R2-P0-02 & R2-P1-06).
+        """Run deterministic QA checks (L1 + L2a) and create/preserve `pending` SemanticReviewTasks.
 
         Invariants:
-        - NEVER marks newly created SemanticReviewTasks as `completed` or `accepted` on creation (R2-P0-02).
-        - NEVER promotes factual SourceBindings to `supported_reviewed` without an accepted semantic review (R2-P1-06).
+        - NEVER marks newly created SemanticReviewTasks as `completed` or `accepted` on creation.
+        - NEVER promotes factual SourceBindings to `supported_reviewed` without an accepted semantic review.
         """
         now_iso = datetime.now(timezone.utc).isoformat()
         state.review_ledger.last_reviewed_at = now_iso
@@ -126,13 +129,7 @@ class ReviewManager:
         sections_to_check = (
             target_section_ids
             if target_section_ids
-            else [
-                s.section_id
-                for s in (
-                    state.profile.structure_profile.required_sections
-                    + state.profile.structure_profile.optional_sections
-                )
-            ]
+            else effective_section_ids(state)
         )
         for section_id in sections_to_check:
             SourcePolicyEvaluator.assert_section(state, section_id)
@@ -209,7 +206,7 @@ class ReviewManager:
             text = sec_state.content_markdown
             words = count_effective_words(text)
 
-            # 2. Word budget check (R3-03 explicit-override-only inheritance)
+            # 2. Word budget check (explicit-override-only inheritance)
             min_w, max_w, _ = resolve_section_word_budget(rule, node, state.outline_graph)
             if words < min_w:
                 add_issue(
@@ -243,7 +240,7 @@ class ReviewManager:
                         suggested_fix=f"Remove '{phrase}' and replace with objective, evidence-backed statements.",
                     )
 
-            # 4. 3-Layer Evidence & L2a Deterministic Rule Checks (DAF-P1-05 & R2-P1-06)
+            # 4. 3-Layer Evidence & L2a Deterministic Rule Checks
             if state.profile.content_profile.evidence_density == "high" and not sec_state.source_bindings:
                 add_issue(
                     severity="major",
@@ -258,17 +255,14 @@ class ReviewManager:
             for binding in sec_state.source_bindings:
                 if binding.binding_id in assessment_by_binding:
                     assess = assessment_by_binding[binding.binding_id]
-                    req_status = str(assess.get("support_status") or "")
+                    req_status = str(assess.get("semantic_support_status") or "")
                     if req_status in {"unsupported", "partially_supported"}:
                         binding.semantic_support_status = req_status  # type: ignore[assignment]
-                        binding.support_status = req_status  # type: ignore[assignment]
-                    if "support_rationale" in assess:
-                        binding.support_rationale = str(assess["support_rationale"])
-                        binding.rationale = binding.support_rationale
+                    if "rationale" in assess:
+                        binding.rationale = str(assess["rationale"])
 
                 if binding.claim_type == "research_hypothesis" and not binding.evidence_id:
                     sup_status, sup_reason = evaluate_claim_binding_support(binding, None)
-                    binding.support_rationale = sup_reason
                     binding.rationale = sup_reason
                     if binding.rule_check_status == "rule_failed":
                         add_issue(
@@ -288,7 +282,6 @@ class ReviewManager:
                     binding.semantic_support_status = (
                         "stale" if (ev and ev.excerpt_match_status in {"source_stale", "stale"}) else "unsupported"
                     )
-                    binding.support_status = binding.semantic_support_status
                     binding.reviewed_against_revision = None
                     binding.reviewed_against_section_hash = ""
                     binding.reviewed_against_evidence_fingerprint = ""
@@ -306,7 +299,6 @@ class ReviewManager:
                     continue
 
                 det_status, det_reason = evaluate_claim_binding_support(binding, ev)
-                binding.support_rationale = det_reason
                 binding.rationale = det_reason
 
                 if binding.rule_check_status == "rule_failed" or det_status in {"unsupported", "partially_supported", "stale"}:
@@ -369,13 +361,13 @@ class ReviewManager:
 
         state.review_ledger.issues = retained_issues + new_issues
 
-        # Refresh existing semantic review tasks and create pending tasks for unreviewed/updated sections (R2-P0-02)
+        # Refresh existing semantic review tasks and create pending tasks for unreviewed/updated sections
         cls.refresh_semantic_task_staleness(state)
         existing_tasks_by_id = {t.task_id: t for t in state.review_ledger.semantic_review_tasks}
         updated_tasks: list[SemanticReviewTask] = [
             t
             for t in state.review_ledger.semantic_review_tasks
-            if (t.section_id or (t.target_section_ids[0] if t.target_section_ids else "")) not in sections_to_check
+            if t.section_id not in sections_to_check
         ]
 
         for sec_id in sections_to_check:
@@ -405,7 +397,7 @@ class ReviewManager:
 
             # Mark any older tasks for this section as stale
             for old_t in state.review_ledger.semantic_review_tasks:
-                old_sec = old_t.section_id or (old_t.target_section_ids[0] if old_t.target_section_ids else "")
+                old_sec = old_t.section_id
                 if old_sec == sec_id and old_t.task_id != task_id and old_t.status not in {"stale", "expired", "rejected"}:
                     old_t.status = "stale"
                     old_t.stale_reason = f"Superseded by task '{task_id}'."
@@ -425,12 +417,10 @@ class ReviewManager:
                     task_id=task_id,
                     requires_structured_checklist=True,
                     section_id=sec_id,
-                    target_section_ids=[sec_id],
                     target_section_revision=sec_state.revision,
                     target_section_content_hash=sec_state.content_hash,
                     target_context_fingerprint=current_fp,
                     review_dimension="section_argumentation_and_consistency",
-                    checklist_questions=checklist,
                     checklist_items=checklist_items,
                     evaluation_rubric=(
                         "Evaluate whether the section satisfies all required elements, answers every checklist item, "
@@ -490,7 +480,7 @@ class ReviewManager:
         state: ProjectWorkspaceState,
         status: str | None = None,
     ) -> dict[str, Any]:
-        """List semantic review tasks after refreshing staleness against current state (R2-P0-02 §2.3)."""
+        """List semantic review tasks after refreshing staleness against current state."""
         cls.refresh_semantic_task_staleness(state)
         tasks = state.review_ledger.semantic_review_tasks
         if status:
@@ -499,7 +489,7 @@ class ReviewManager:
         enriched: list[dict[str, Any]] = []
         for t in tasks:
             d = t.model_dump(mode="json")
-            sec_id = t.section_id or (t.target_section_ids[0] if t.target_section_ids else "")
+            sec_id = t.section_id
             sec = state.section_versions.sections.get(sec_id)
             if sec:
                 d["pending_claim_bindings"] = [
@@ -525,9 +515,16 @@ class ReviewManager:
         cls,
         state: ProjectWorkspaceState,
         task_id: str,
-        agent_session_id: str = "external-agent",
+        agent_session_id: str | None = None,
     ) -> dict[str, Any]:
-        """Claim a pending semantic review task (R2-P0-02 §2.3)."""
+        """Claim a pending semantic review task."""
+        eff_reviewer = (agent_session_id or "").strip()
+        if len(eff_reviewer) < 3:
+            raise ContractValidationError(
+                "reviewer_id / agent_session_id is required (>= 3 non-whitespace characters).",
+                code="REVIEWER_ID_REQUIRED",
+                details={"task_id": task_id},
+            )
         cls.refresh_semantic_task_staleness(state)
         task = next((t for t in state.review_ledger.semantic_review_tasks if t.task_id == task_id), None)
         if task is None:
@@ -546,28 +543,24 @@ class ReviewManager:
                 f"SemanticReviewTask '{task_id}' cannot be claimed from status '{task.status}'.",
                 details={"task_id": task_id, "status": task.status},
             )
-        # P0-2C: Prevent the author session from claiming its own section review
-        sec_id = task.section_id or (task.target_section_ids[0] if task.target_section_ids else "")
+        # Prevent missing or identical author_session from claiming the section review
+        sec_id = task.section_id
         sec_state = state.section_versions.sections.get(sec_id)
-        if (
-            sec_state is not None
-            and sec_state.author_session
-            and agent_session_id
-            and sec_state.author_session.strip() == agent_session_id.strip()
-        ):
+        eff_author = (sec_state.author_session or "").strip() if sec_state is not None else ""
+        if sec_state is not None and (len(eff_author) < 3 or eff_author == eff_reviewer):
             raise ContractValidationError(
-                f"Reviewer '{agent_session_id}' cannot review section '{sec_id}' authored by the same session.",
+                f"Reviewer '{eff_reviewer}' cannot review section '{sec_id}' (missing/invalid or matching author_session '{eff_author}').",
                 code="REVIEWER_IS_AUTHOR",
                 details={
                     "task_id": task_id,
                     "section_id": sec_id,
                     "author_session": sec_state.author_session,
-                    "reviewer_id": agent_session_id,
+                    "reviewer_id": eff_reviewer,
                 },
             )
         now_iso = datetime.now(timezone.utc).isoformat()
         task.status = "claimed"
-        task.claimed_by = agent_session_id
+        task.claimed_by = eff_reviewer
         task.claimed_at = now_iso
         return task.model_dump(mode="json")
 
@@ -580,14 +573,21 @@ class ReviewManager:
         context_fingerprint: str,
         findings: list[dict[str, Any] | SemanticReviewFinding] | None,
         review_summary: str,
-        reviewer_agent: str = "external-agent",
+        reviewer_agent: str | None = None,
         claim_evaluations: list[dict[str, Any]] | None = None,
         checklist_results: list[dict[str, Any] | ChecklistItemResult] | None = None,
         checklist_hash: str | None = None,
-        require_structured_checklist: bool = False,
+        require_structured_checklist: bool = True,
         recommendation: str | None = None,
     ) -> dict[str, Any]:
-        """Submit a structured SemanticReviewReport for a specific task_id, revision, context_fingerprint, and checklist (R2-P0-02 & R3-01)."""
+        """Submit a structured SemanticReviewReport for a specific task_id, revision, context_fingerprint, and checklist."""
+        eff_reviewer = (reviewer_agent or "").strip()
+        if len(eff_reviewer) < 3:
+            raise ContractValidationError(
+                "reviewer_id / reviewed_by is required (>= 3 non-whitespace characters).",
+                code="REVIEWER_ID_REQUIRED",
+                details={"task_id": task_id},
+            )
         cls.refresh_semantic_task_staleness(state)
         task = next((t for t in state.review_ledger.semantic_review_tasks if t.task_id == task_id), None)
         if task is None:
@@ -606,15 +606,12 @@ class ReviewManager:
                 details={"task_id": task_id},
             )
 
-        sec_id = task.section_id or (task.target_section_ids[0] if task.target_section_ids else "")
+        sec_id = task.section_id
         SourcePolicyEvaluator.assert_section(state, sec_id)
         require_structured_checklist = require_structured_checklist or task.requires_structured_checklist
-        if task.requires_structured_checklist:
-            missing = [name for name, value in (("recommendation", recommendation), ("findings", findings)) if value is None]
-            if missing:
-                raise ContractValidationError("新审核必须显式提交审核结论和 findings（允许空列表）。", details={"missing_fields": missing})
-        if recommendation is None and not task.requires_structured_checklist:
-            recommendation = "approve"  # Explicit legacy-task compatibility only.
+        missing = [name for name, value in (("recommendation", recommendation), ("findings", findings)) if value is None]
+        if missing:
+            raise ContractValidationError("必须显式提交 recommendation 和 findings（允许空列表）。", details={"missing_fields": missing})
         if recommendation not in {"approve", "revise", "block"}:
             raise ContractValidationError("recommendation 必须为 approve、revise 或 block。")
         sec_state = state.section_versions.sections.get(sec_id)
@@ -623,6 +620,18 @@ class ReviewManager:
             raise SemanticReviewStaleError(
                 f"Target section '{sec_id}' for task '{task_id}' has no drafted content.",
                 details={"task_id": task_id, "section_id": sec_id},
+            )
+        eff_author = (sec_state.author_session or "").strip()
+        if len(eff_author) < 3 or eff_author == eff_reviewer:
+            raise ContractValidationError(
+                f"Reviewer '{eff_reviewer}' cannot submit review for section '{sec_id}' (missing/invalid or matching author_session '{eff_author}').",
+                code="REVIEWER_IS_AUTHOR",
+                details={
+                    "task_id": task_id,
+                    "section_id": sec_id,
+                    "author_session": sec_state.author_session,
+                    "reviewer_id": eff_reviewer,
+                },
             )
 
         binding_ids = {binding.binding_id for binding in sec_state.source_bindings}
@@ -679,7 +688,7 @@ class ReviewManager:
                 details={"task_id": task_id},
             ) from exc
 
-        # Validate structured checklist_results if provided or required (R3-01 §5.2)
+        # Validate structured checklist_results if provided or required
         expected_check_map = {item.check_id: item.question for item in task.checklist_items}
         parsed_checklist_results: list[ChecklistItemResult] = []
         checklist_mode: str = "structured_verified"
@@ -730,6 +739,8 @@ class ReviewManager:
                 ) from exc
 
             seen_check_ids: set[str] = set()
+            norm_section_body = normalize_for_verification(sec_state.content_markdown)
+            full_sentence_norms: set[str] | None = None
             for r_item in parsed_checklist_results:
                 if r_item.check_id in seen_check_ids:
                     task.status = "rejected"
@@ -750,19 +761,9 @@ class ReviewManager:
                             "expected_check_ids": list(expected_check_map.keys()),
                         },
                     )
-                if not r_item.rationale or not r_item.rationale.strip():
-                    task.status = "rejected"
-                    task.rejection_reason = f"Checklist item '{r_item.check_id}' rationale cannot be empty."
-                    raise ReviewChecklistIncompleteError(
-                        task.rejection_reason,
-                        details={"task_id": task_id, "check_id": r_item.check_id},
-                    )
-                # P0-2C: Every checklist item must be anchored in actual section text
-                from daf.context_manager.manager import normalize_for_verification
-
-                norm_section_body = normalize_for_verification(sec_state.content_markdown)
+                rationale_clean = (r_item.rationale or "").strip()
                 if r_item.verdict == "not_applicable":
-                    if len(r_item.rationale.strip()) < 20:
+                    if len(rationale_clean) < 20:
                         task.status = "rejected"
                         task.rejection_reason = (
                             f"Checklist item '{r_item.check_id}' marked 'not_applicable' requires a rationale of at least 20 characters."
@@ -772,6 +773,15 @@ class ReviewManager:
                             details={"task_id": task_id, "check_id": r_item.check_id},
                         )
                 else:
+                    if len(rationale_clean) < 15:
+                        task.status = "rejected"
+                        task.rejection_reason = (
+                            f"Checklist item '{r_item.check_id}' verdict '{r_item.verdict}' requires a substantive rationale of at least 15 characters."
+                        )
+                        raise ReviewChecklistIncompleteError(
+                            task.rejection_reason,
+                            details={"task_id": task_id, "check_id": r_item.check_id, "rationale_length": len(rationale_clean)},
+                        )
                     if not r_item.quotes:
                         task.status = "rejected"
                         task.rejection_reason = (
@@ -792,6 +802,25 @@ class ReviewManager:
                                 task.rejection_reason,
                                 details={"task_id": task_id, "check_id": r_item.check_id, "quote": q[:120]},
                             )
+                        if len(norm_q) < 10:
+                            if full_sentence_norms is None:
+                                parsed_sents, _stats, _ast = analyze_markdown_with_pandoc(sec_state.content_markdown)
+                                full_sentence_norms = {
+                                    normalize_for_verification(s.text)
+                                    for s in parsed_sents
+                                    if s.text and normalize_for_verification(s.text)
+                                }
+                            norm_q_stripped = normalize_for_verification(re.sub(r"\[@[^\]]+\]", "", q))
+                            if norm_q not in full_sentence_norms and norm_q_stripped not in full_sentence_norms:
+                                task.status = "rejected"
+                                task.rejection_reason = (
+                                    f"Checklist item '{r_item.check_id}' quote must be at least 10 normalized characters "
+                                    "or equal a complete parsed sentence from the section."
+                                )
+                                raise ReviewChecklistIncompleteError(
+                                    task.rejection_reason,
+                                    details={"task_id": task_id, "check_id": r_item.check_id, "quote_length": len(norm_q)},
+                                )
                 if not r_item.question:
                     r_item.question = expected_check_map[r_item.check_id]
                 elif r_item.question != expected_check_map[r_item.check_id]:
@@ -799,6 +828,24 @@ class ReviewManager:
                 SourcePolicyEvaluator.assert_evidence(state, r_item.evidence_ids)
                 if not r_item.section_locations:
                     r_item.section_locations = [f"{sec_id}:section"]
+
+            active_quoted_items = [r for r in parsed_checklist_results if r.verdict != "not_applicable"]
+            if len(active_quoted_items) > 3:
+                distinct_quotes = {
+                    normalize_for_verification(q)
+                    for r in active_quoted_items
+                    for q in r.quotes
+                    if normalize_for_verification(q)
+                }
+                if len(distinct_quotes) <= 1:
+                    task.status = "rejected"
+                    task.rejection_reason = (
+                        f"Checklist has {len(active_quoted_items)} non-N/A items (>3); all items cannot cite the same single quote."
+                    )
+                    raise ReviewChecklistIncompleteError(
+                        task.rejection_reason,
+                        details={"task_id": task_id, "checklist_count": len(active_quoted_items)},
+                    )
 
             missing_check_ids = [cid for cid in expected_check_map if cid not in seen_check_ids]
             if missing_check_ids:
@@ -881,9 +928,9 @@ class ReviewManager:
             section_revision=sec_state.revision,
             section_content_hash=sec_state.content_hash,
             context_fingerprint=post_submit_fp,
-            reviewer_agent=reviewer_agent or "external-agent",
+            reviewer_agent=eff_reviewer,
             review_summary=summary_clean,
-            recommendation=recommendation,
+            recommendation=recommendation,  # type: ignore[arg-type]
             findings=validated_findings,
             claim_evaluations=list(claim_evaluations or []),
             checklist_hash=eff_checklist_hash,
@@ -897,7 +944,7 @@ class ReviewManager:
         task.submitted_at = now_iso
         task.rejection_reason = ""
 
-        # P0-2C: Submit-is-accept for valid approving reports
+        # Submit-is-accept for valid approving reports
         has_failing_check = any(r.verdict in {"fail", "needs_revision"} for r in parsed_checklist_results)
         has_major_finding = any(f.severity in {"critical", "major"} for f in validated_findings)
         if report.recommendation == "approve" and not has_failing_check and not has_major_finding:
@@ -922,7 +969,7 @@ class ReviewManager:
         policy_version: str = "v1",
         require_structured_checklist: bool = False,
     ) -> dict[str, Any]:
-        """Validate a submitted SemanticReviewReport against live section/evidence hashes, L2a rules, and checklist verdicts, then mark accepted (R2-P0-02, R2-P1-06 & R3-01)."""
+        """Validate a submitted SemanticReviewReport against live section/evidence hashes, L2a rules, and checklist verdicts, then mark accepted."""
         cls.refresh_semantic_task_staleness(state)
         task = next((t for t in state.review_ledger.semantic_review_tasks if t.task_id == task_id), None)
         if task is None:
@@ -945,7 +992,7 @@ class ReviewManager:
         report = task.report
         require_structured_checklist = require_structured_checklist or task.requires_structured_checklist
         SourcePolicyEvaluator.assert_section(state, report.section_id)
-        if report.recommendation != "approve" and (task.requires_structured_checklist or report.recommendation is not None):
+        if report.recommendation != "approve":
             raise ApprovalConflictError(
                 "审稿要求修订或阻断，不能接受为通过。", code="SEMANTIC_REVIEW_REQUIRED",
                 details={"recommendation": report.recommendation, "task_id": task_id},
@@ -978,7 +1025,7 @@ class ReviewManager:
                 },
             )
 
-        # Validate checklist integrity and verdicts (R3-01 §5.2)
+        # Validate checklist integrity and verdicts
         if require_structured_checklist and report.checklist_verification_mode != "structured_verified":
             raise ReviewChecklistIncompleteError(
                 f"Cannot accept task '{task_id}': structured checklist_results are required but report mode is '{report.checklist_verification_mode}'.",
@@ -1015,7 +1062,7 @@ class ReviewManager:
                     },
                 )
 
-        # Apply L2b claim_evaluations and verify no rule_failed binding is overridden (R2-P1-06 §6.3 & §6.4)
+        # Apply L2b claim_evaluations and verify no rule_failed binding is overridden
         binding_map = {b.binding_id: b for b in sec_state.source_bindings}
         evaluation_ids = [str(item.get("binding_id") or "") for item in report.claim_evaluations]
         if len(evaluation_ids) != len(set(evaluation_ids)) or any(bid not in binding_map for bid in evaluation_ids):
@@ -1027,8 +1074,8 @@ class ReviewManager:
                 raise ContractValidationError("审核未覆盖全部事实性 Claim。", code="CLAIM_REVIEW_PENDING", details={"missing_binding_ids": missing_ids})
         for eval_item in report.claim_evaluations:
             bid = str(eval_item.get("binding_id") or "")
-            sem_status = str(eval_item.get("semantic_support_status") or eval_item.get("support_status") or "")
-            rationale = str(eval_item.get("rationale") or eval_item.get("support_rationale") or "")
+            sem_status = str(eval_item.get("semantic_support_status") or "")
+            rationale = str(eval_item.get("rationale") or "")
             if not bid or bid not in binding_map:
                 task.status = "rejected"
                 report.status = "rejected"
@@ -1101,7 +1148,7 @@ class ReviewManager:
                     )
                 )
 
-        # Block acceptance if the report contains blocker or major semantic findings (R2-P0-02 §2.4)
+        # Block acceptance if the report contains blocker or major semantic findings
         blocking_findings = [
             f for f in report.findings if f.severity in {"blocker", "major"}
         ]

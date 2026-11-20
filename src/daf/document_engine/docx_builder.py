@@ -1,4 +1,4 @@
-"""Unified DocumentIR -> DOCX Compiler (Builtin / Tagged / Mapped), RenderManifest Snapshot Binder & Isolated PDF Exporter (DAF-P0-04 & DAF-P1-06)."""
+"""Unified DocumentIR -> DOCX Compiler (Builtin / Tagged / Mapped), RenderManifest Snapshot Binder & Isolated PDF Exporter."""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ def _sha256_file(path: Path) -> str:
 
 
 def _canonicalize_docx_zip(path: Path) -> None:
-    """Repack a .docx zip archive in memory with sorted entry names and a fixed DOS timestamp so identical XML content yields an identical SHA-256."""
+    """Repack a.docx zip archive in memory with sorted entry names and a fixed DOS timestamp so identical XML content yields an identical SHA-256."""
     fixed_dt = (2026, 1, 1, 0, 0, 0)
     raw = path.read_bytes()
     entries: list[tuple[str, bytes]] = []
@@ -128,7 +128,7 @@ def compute_render_input_fingerprint(
     section_mapping: dict[str, str] | None = None,
     degradation_mode: Literal["strict", "preview_plaintext"] = "strict",
 ) -> dict[str, Any]:
-    """Compute the deterministic RenderManifest input fingerprint and component hashes (DAF-P0-04 §4.2)."""
+    """Compute the deterministic RenderManifest input fingerprint and component hashes."""
     tpl_report = state.source_registry.template_inspection
     effective_mode = template_mode
     if effective_mode == "auto":
@@ -225,7 +225,7 @@ class DocumentEngine:
     ) -> tuple[list[Any], int, int]:
         """Compile a Markdown / LaTeX fragment into detached, font-sanitized OpenXML (<w:p>, <w:tbl>) elements.
 
-        Never mutates any caller document directly, preventing tail-append displacement bugs in mapped/tagged modes (T-DOC-02).
+        Never mutates any caller document directly, preventing tail-append displacement bugs in mapped/tagged modes.
         """
         if not markdown_text.strip():
             return [], 0, 0
@@ -553,7 +553,7 @@ class DocumentEngine:
     @classmethod
     def verify_rendered_docx_qa(
         cls,
-        docx_path: Path,
+        artifact_path: Path,
         ir: DocumentIR,
         effective_mode: str,
         degradation_mode: Literal["strict", "preview_plaintext"],
@@ -561,11 +561,11 @@ class DocumentEngine:
         template_before_sha: str | None = None,
         initial_tail_paragraph_texts: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Run unified OpenXML & structural QA checks on the compiled .docx before atomic promotion (DAF-P1-06 §6.5)."""
-        if not docx_path.exists() or docx_path.stat().st_size == 0:
+        """Run unified OpenXML & structural QA checks on the compiled.docx before atomic promotion."""
+        if not artifact_path.exists() or artifact_path.stat().st_size == 0:
             raise TemplateRenderError("Rendered DOCX file is missing or empty.")
 
-        # 1. Verify original template immutability (T-DOC-05)
+        # 1. Verify original template immutability
         if template_path is not None and template_before_sha is not None:
             after_sha = _sha256_file(template_path)
             if after_sha != template_before_sha:
@@ -574,7 +574,7 @@ class DocumentEngine:
                 )
 
         # 2. Re-open with python-docx
-        doc = docx.Document(str(docx_path))
+        doc = docx.Document(str(artifact_path))
         body = doc._body._body
 
         # 3. Check for unrendered Jinja2 placeholders
@@ -591,7 +591,7 @@ class DocumentEngine:
                 code="TEMPLATE_MAPPING_INVALID",
             )
 
-        # 4. Check OMML equations in strict mode (T-DOC-01)
+        # 4. Check OMML equations in strict mode
         m_oMath = qn("m:oMath")
         m_oMathPara = qn("m:oMathPara")
         omml_nodes = list(body.iter(m_oMath)) + list(body.iter(m_oMathPara))
@@ -608,14 +608,14 @@ class DocumentEngine:
                     code="RENDER_DEPENDENCY_MISSING",
                 )
 
-        # 5. Check that w:hint is completely stripped across all w:rFonts (T-DOC-05)
+        # 5. Check that w:hint is completely stripped across all w:rFonts
         w_rFonts = qn("w:rFonts")
         w_hint = qn("w:hint")
         for rfonts in body.iter(w_rFonts):
             if w_hint in rfonts.attrib:
                 raise TemplateRenderError("OpenXML QA failed: w:hint attribute was not stripped from w:rFonts.")
 
-        # 6. In mapped table mode, verify no section content was accidentally appended to the document tail (T-DOC-02)
+        # 6. In mapped table mode, verify no section content was accidentally appended to the document tail
         if effective_mode == "mapped" and initial_tail_paragraph_texts is not None:
             current_body_paras = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
             if len(current_body_paras) > len(initial_tail_paragraph_texts):
@@ -648,7 +648,7 @@ class DocumentEngine:
         update_state_in_place: bool = True,
         simulate_crash_before_finalize: bool = False,
     ) -> dict[str, Any]:
-        """Compile DocumentIR into a native .docx via atomic .tmp promotion and record RenderManifest (DAF-P0-04, DAF-P1-06 & R2-P1-05)."""
+        """Compile DocumentIR into a native.docx via atomic.tmp promotion and record RenderManifest."""
         if output_dir.exists() and output_dir.is_symlink():
             raise ArtifactPathInvalidError(
                 f"Security violation: output_dir '{output_dir}' cannot be a symbolic link."
@@ -989,10 +989,10 @@ class DocumentEngine:
             else:
                 raise TemplateRenderError(f"Unsupported template_mode '{effective_mode}'.")
 
-            # Run unified OpenXML & structural QA before promoting from .tmp/
+            # Run unified OpenXML & structural QA before promoting from.tmp/
             _canonicalize_docx_zip(tmp_output_path)
             qa_report = cls.verify_rendered_docx_qa(
-                docx_path=tmp_output_path,
+                artifact_path=tmp_output_path,
                 ir=ir,
                 effective_mode=effective_mode,
                 degradation_mode=eff_degradation,
@@ -1001,7 +1001,7 @@ class DocumentEngine:
                 initial_tail_paragraph_texts=initial_tail_paras,
             )
 
-            # Atomically move verified .tmp file to final output path
+            # Atomically move verified.tmp file to final output path
             os.replace(str(tmp_output_path), str(final_output_path))
         finally:
             if tmp_output_path.exists():
@@ -1030,10 +1030,8 @@ class DocumentEngine:
             template_sha256=fp_info["template_sha256"],
             section_mapping_hash=fp_info["section_mapping_hash"],
             renderer_version=RENDERER_VERSION,
-            docx_path=str(final_output_path),
             artifact_path=str(final_output_path),
-            docx_sha256=f"sha256:{output_sha}",
-            output_sha256=f"sha256:{output_sha}",
+            artifact_sha256=f"sha256:{output_sha}",
             artifact_status="committed",
             omml_equations_count=qa_report["omml_node_count"],
             tables_rendered=total_tables,
@@ -1044,7 +1042,6 @@ class DocumentEngine:
                 state.last_render_manifest.artifact_status = "superseded"
                 state.render_history.append(state.last_render_manifest)
             state.last_render_manifest = manifest
-            state.last_rendered_docx_path = str(final_output_path)
             if purpose == "release":
                 state.stage = "rendered"
 
@@ -1055,8 +1052,8 @@ class DocumentEngine:
             "purpose": purpose,
             "degradation_mode": eff_degradation,
             "template_mode": effective_mode,
-            "docx_path": str(final_output_path),
-            "docx_sha256": output_sha,
+            "artifact_path": str(final_output_path),
+            "artifact_sha256": output_sha,
             "input_fingerprint": fp_info["input_fingerprint"],
             "sections_rendered": [s.section_id for s in ir.sections],
             "omml_equations_count": qa_report["omml_node_count"],
@@ -1067,9 +1064,9 @@ class DocumentEngine:
         }
 
     @staticmethod
-    def export_pdf_via_word_com(docx_path: str | Path, pdf_path: str | Path, timeout_sec: int = 60) -> dict[str, Any]:
-        """Export a .docx file to .pdf on Windows using an isolated child process running Word COM."""
-        src = Path(docx_path).resolve()
+    def export_pdf_via_word_com(source_docx_path: str | Path, pdf_path: str | Path, timeout_sec: int = 60) -> dict[str, Any]:
+        """Export a.docx file to.pdf on Windows using an isolated child process running Word COM."""
+        src = Path(source_docx_path).resolve()
         dst = Path(pdf_path).resolve()
         if not src.exists():
             raise PDFExportError(f"Cannot export PDF: source DOCX does not exist at '{src}'.")
@@ -1079,7 +1076,7 @@ class DocumentEngine:
             )
 
         dst.parent.mkdir(parents=True, exist_ok=True)
-        # Remove any pre-existing target PDF first so an old PDF can NEVER be mistaken for a new export on failure (T-REN-05)
+        # Remove any pre-existing target PDF first so an old PDF can NEVER be mistaken for a new export on failure
         tmp_pdf = dst.parent / f".tmp_{uuid.uuid4().hex[:8]}_{dst.name}"
         child_script = (
             "import sys, pythoncom, win32com.client\n"

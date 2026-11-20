@@ -249,7 +249,7 @@ def resolve_task_state(
         tasks = [
             t
             for t in view.review_ledger.semantic_review_tasks
-            if t.section_id == section_id or section_id in t.target_section_ids
+            if t.section_id == section_id
         ]
         current = [
             t
@@ -306,17 +306,6 @@ def resolve_task_state(
         params = {**base, "task_id": task.task_id}
         if task.status == "submitted":
             report = task.report
-            if (
-                report
-                and task.requires_structured_checklist
-                and report.recommendation is None
-            ):
-                return result.route(
-                    "submit_semantic_review",
-                    params,
-                    "REVIEW_DECISION_REQUIRED",
-                    readiness="needs_input",
-                )
             if (
                 not report
                 or report.recommendation in {"revise", "block"}

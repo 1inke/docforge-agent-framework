@@ -180,7 +180,7 @@ def check_profile_template_conflicts(
     profile: DocumentProfileContract,
     template_report: TemplateInspectionReport | None,
 ) -> list[dict[str, str]]:
-    """Detect conflicts or coverage gaps between a DocumentProfileContract and an inspected .docx template."""
+    """Detect conflicts or coverage gaps between a DocumentProfileContract and an inspected.docx template."""
     if template_report is None:
         return []
 

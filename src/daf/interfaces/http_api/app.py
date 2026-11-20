@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from daf import __version__
 from daf.core.engine import DAFEngine
 from daf.core.errors import (
     ApprovalConflictError,
@@ -51,7 +52,7 @@ def create_http_app(
 ) -> FastAPI:
     app = FastAPI(
         title="DocForge Agent Framework (DAF) HTTP API",
-        version="2.0.0",
+        version=__version__,
         description="Stateful, contract-enforced execution API for external AI Agents.",
     )
     engine = DAFEngine(workspace_root=workspace_root, allowed_source_roots=allowed_source_roots)

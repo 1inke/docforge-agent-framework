@@ -1,4 +1,4 @@
-"""Core Data Contracts and Working Memory Models for DocForge Agent Framework (DAF §3.2, §3.3, §6 & Remediation R1/R2)."""
+"""Core Data Contracts and Working Memory Models for DocForge Agent Framework."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def utc_now_iso() -> str:
@@ -38,7 +38,7 @@ class ProjectSourcePolicy(StrictContractModel):
     external_lookup_enabled: bool = False
     updated_by: str = "trusted_initialization"
     reason: str = "Initial project-only policy."
-    approved_at: str | None = None
+    confirmed_at: str | None = None
 
 
 class GuidanceInstruction(StrictContractModel):
@@ -142,7 +142,7 @@ class DocumentProfileContract(StrictContractModel):
 
 
 # ============================================================================
-# 2. Source Registry & Versioned 3-Layer Evidence Ledger (DAF-P1-05 & R2-P0-03)
+# 2. Source Registry & Versioned 3-Layer Evidence Ledger
 # ============================================================================
 
 
@@ -187,7 +187,7 @@ class SourceRegistry(StrictContractModel):
 
 
 class EvidenceRevision(StrictContractModel):
-    """Auditable historical revision of an EvidenceItem (R2-P0-03 §3.2)."""
+    """Auditable historical revision of an EvidenceItem."""
 
     evidence_id: str
     revision: int
@@ -209,7 +209,7 @@ class EvidenceRevision(StrictContractModel):
 
 
 class EvidenceItem(StrictContractModel):
-    """Versioned Three-layer Evidence Record (DAF-P1-05 & R2-P0-03):
+    """Versioned Three-layer Evidence Record:
     - L1 excerpt_match_status: deterministic substring verification against immutable SourceBlockSlice.
     - L3 source_reliability: trustworthiness assessment of the underlying source document.
     - evidence_revision & evidence_fingerprint: versioned identity for cascade invalidation.
@@ -222,7 +222,6 @@ class EvidenceItem(StrictContractModel):
     claim_summary: str
     quote_excerpt: str
     excerpt_match_status: Literal["matched", "not_matched", "unmatched", "source_stale", "stale"] = "matched"
-    verification_status: Literal["verified", "unverified_excerpt"] = "verified"
     source_reliability: Literal[
         "unassessed",
         "trusted",
@@ -243,11 +242,9 @@ class EvidenceItem(StrictContractModel):
     @model_validator(mode="after")
     def _sync_l1_l3_and_fingerprint(self) -> "EvidenceItem":
         if self.excerpt_match_status in {"not_matched", "unmatched", "source_stale", "stale"}:
-            self.verification_status = "unverified_excerpt"
-        elif self.verification_status == "unverified_excerpt":
-            self.excerpt_match_status = "not_matched"
+            if self.excerpt_match_status == "unmatched":
+                self.excerpt_match_status = "not_matched"
         else:
-            self.verification_status = "verified"
             self.excerpt_match_status = "matched"
 
         # Prevent circular self-citation (§5.4.5): agent-generated summaries cannot be 'trusted' primary sources
@@ -324,12 +321,12 @@ class DecisionLog(StrictContractModel):
 
 
 # ============================================================================
-# 4. Section Context (DAF-P0-01), L2a/L2b Claim Bindings (R2-P1-06) & Review (R2-P0-02)
+# 4. Section Context, L2a/L2b Claim Bindings & Review
 # ============================================================================
 
 
 class DependencySnapshot(StrictContractModel):
-    """Deterministic task-scoped dependency snapshot for a section (DAF-P0-01)."""
+    """Deterministic task-scoped dependency snapshot for a section."""
 
     outline_revision: int = 0
     outline_hash: str = ""
@@ -343,7 +340,7 @@ class DependencySnapshot(StrictContractModel):
 
 
 class RuleCheckResult(StrictContractModel):
-    """L2a deterministic rule check result on a SourceBinding (R2-P1-06 §6.3)."""
+    """L2a deterministic rule check result on a SourceBinding."""
 
     binding_id: str
     status: Literal["rule_passed", "rule_failed", "needs_manual_check"]
@@ -352,7 +349,7 @@ class RuleCheckResult(StrictContractModel):
 
 
 class SemanticSupportReview(StrictContractModel):
-    """L2b semantic support review record bound to specific section & evidence hashes (R2-P1-06 §7.1)."""
+    """L2b semantic support review record bound to specific section & evidence hashes."""
 
     binding_id: str
     semantic_support_status: Literal[
@@ -373,7 +370,7 @@ class SemanticSupportReview(StrictContractModel):
 
 
 class SourceBinding(StrictContractModel):
-    """L2a + L2b Claim–Evidence Binding Record (DAF-P1-05 & R2-P1-06):
+    """L2a + L2b Claim–Evidence Binding Record:
     - rule_check_status (L2a): deterministic checks (quantitative conflict, overclaim, ungrounded metrics).
     - semantic_support_status (L2b): Agent/human semantic entailment judgment bound to section & evidence versions.
     """
@@ -399,16 +396,6 @@ class SourceBinding(StrictContractModel):
         "hypothesis_proposal",
         "stale",
     ] = "pending"
-    support_status: Literal[
-        "supported",
-        "supported_reviewed",
-        "partially_supported",
-        "unsupported",
-        "pending",
-        "hypothesis_proposal",
-        "stale",
-    ] = "pending"
-    support_rationale: str = ""
     rationale: str = ""
     reviewer: str = ""
     reviewed_against_revision: int | None = None
@@ -416,27 +403,14 @@ class SourceBinding(StrictContractModel):
     reviewed_against_evidence_fingerprint: str = ""
     reviewed_evidence_revision: int | None = None
 
-    @model_validator(mode="after")
-    def _sync_rationale_and_status(self) -> "SourceBinding":
-        if self.rationale and not self.support_rationale:
-            self.support_rationale = self.rationale
-        elif self.support_rationale and not self.rationale:
-            self.rationale = self.support_rationale
-
-        # If rule_check_status failed, semantic_support_status cannot override it to supported_reviewed
+    @property
+    def support_status(self) -> str:
+        """Computed support status derived solely from L2a rule check + L2b semantic support review."""
         if self.rule_check_status == "rule_failed":
-            self.support_status = "unsupported"
-        elif self.semantic_support_status == "supported_reviewed":
-            self.support_status = "supported"
-        elif self.semantic_support_status in {
-            "partially_supported",
-            "unsupported",
-            "pending",
-            "hypothesis_proposal",
-            "stale",
-        }:
-            self.support_status = self.semantic_support_status
-        return self
+            return "unsupported"
+        if self.semantic_support_status == "supported_reviewed":
+            return "supported"
+        return self.semantic_support_status
 
 
 class StructuredBlock(StrictContractModel):
@@ -476,7 +450,7 @@ class ReviewIssue(StrictContractModel):
 
 
 class SemanticReviewFinding(StrictContractModel):
-    """Individual finding reported in a SemanticReviewReport (R2-P0-02 §2.4)."""
+    """Individual finding reported in a SemanticReviewReport."""
 
     severity: Literal["blocker", "major", "minor"]
     category: Literal[
@@ -499,7 +473,7 @@ class SemanticReviewFinding(StrictContractModel):
 
 
 class ChecklistItemSpec(StrictContractModel):
-    """Numbered, verifiable checklist item in a SemanticReviewTask (R3-01 §5.2)."""
+    """Numbered, verifiable checklist item in a SemanticReviewTask."""
 
     check_id: str
     question: str
@@ -519,7 +493,7 @@ class ChecklistItemResult(StrictContractModel):
 
 
 class SemanticReviewReport(StrictContractModel):
-    """Formal semantic review artifact submitted by an external Agent (R2-P0-02 §2.4, §7.1 & R3-01 §5.2)."""
+    """Formal semantic review artifact submitted by an external Agent."""
 
     task_id: str
     project_id: str
@@ -529,8 +503,7 @@ class SemanticReviewReport(StrictContractModel):
     context_fingerprint: str
     reviewer_agent: str
     review_summary: str
-    # Historical missing decisions remain unknown; new submissions are validated at ingress.
-    recommendation: Literal["approve", "revise", "block"] | None = None
+    recommendation: Literal["approve", "revise", "block"]
     findings: list[SemanticReviewFinding] = Field(default_factory=list)
     claim_evaluations: list[dict[str, Any]] = Field(default_factory=list)
     checklist_hash: str = ""
@@ -543,18 +516,15 @@ class SemanticReviewReport(StrictContractModel):
 
 
 class SemanticReviewTask(StrictContractModel):
-    """Semantic review task lifecycle: pending -> claimed -> submitted -> accepted (or expired/rejected/stale) (R2-P0-02 §2.3 & R3-01 §5.2)."""
+    """Semantic review task lifecycle: pending -> claimed -> submitted -> accepted (or expired/rejected/stale)."""
 
     task_id: str
-    # Missing in historical snapshots: retain readability without upgrading old reports.
-    requires_structured_checklist: bool = False
+    requires_structured_checklist: bool = True
     section_id: str = ""
-    target_section_ids: list[str] = Field(default_factory=list)
     target_section_revision: int = 0
     target_section_content_hash: str = ""
     target_context_fingerprint: str = ""
     review_dimension: str
-    checklist_questions: list[str] = Field(default_factory=list)
     checklist_items: list[ChecklistItemSpec] = Field(default_factory=list)
     checklist_hash: str = ""
     evaluation_rubric: str
@@ -577,18 +547,6 @@ class SemanticReviewTask(StrictContractModel):
 
     @model_validator(mode="after")
     def _sync_checklist_items_and_hash(self) -> "SemanticReviewTask":
-        if self.checklist_questions and not self.checklist_items:
-            self.checklist_items = [
-                ChecklistItemSpec(
-                    check_id=f"{self.task_id}:q{idx:02d}",
-                    question=q,
-                    required=True,
-                )
-                for idx, q in enumerate(self.checklist_questions, start=1)
-            ]
-        elif self.checklist_items and not self.checklist_questions:
-            self.checklist_questions = [item.question for item in self.checklist_items]
-
         if self.checklist_items and not self.checklist_hash:
             digest = _canonical_hash_dict(
                 {
@@ -621,7 +579,7 @@ class UpstreamSectionDependency(StrictContractModel):
 
 
 class ContextBudgetMetadata(StrictContractModel):
-    """Explicit character/budget measurement metadata for project and section context responses (R3-05 §4.2)."""
+    """Explicit character/budget measurement metadata for project and section context responses."""
 
     unit: Literal["unicode_chars", "approx_chars"] = "unicode_chars"
     requested_limit: int
@@ -635,7 +593,7 @@ class ContextBudgetMetadata(StrictContractModel):
 
 
 class SectionContextContract(StrictContractModel):
-    """Budgeted, boundary-marked context returned by get_section_context (§6.2, DAF-P0-01 & R3-03/05)."""
+    """Budgeted, boundary-marked context returned by get_section_context (§6.2/05)."""
 
     project_id: str
     section_id: str
@@ -679,9 +637,17 @@ class SectionSubmissionContract(StrictContractModel):
     idempotency_key: str
     content_markdown: str
     summary: str
-    author_session: str = ""
+    author_session: str = Field(..., min_length=3)
     resolved_issue_ids: list[str] = Field(default_factory=list)
     unresolved_questions: list[str] = Field(default_factory=list)
+
+    @field_validator("author_session")
+    @classmethod
+    def _validate_author_session(cls, v: str) -> str:
+        cleaned = v.strip()
+        if len(cleaned) < 3:
+            raise ValueError("author_session must be at least 3 non-whitespace characters.")
+        return cleaned
 
 
 class SectionRevisionRecord(StrictContractModel):
@@ -729,12 +695,12 @@ class SectionVersions(StrictContractModel):
 
 
 # ============================================================================
-# 5. Document IR (DAF-P1-06), RenderJob (R2-P1-05) & RenderManifest (DAF-P0-04)
+# 5. Document IR, RenderJob & RenderManifest
 # ============================================================================
 
 
 class IRBlock(StrictContractModel):
-    """Canonical block in DocumentIR for cross-mode rendering consistency (DAF-P1-06)."""
+    """Canonical block in DocumentIR for cross-mode rendering consistency."""
 
     block_id: str
     section_id: str
@@ -778,7 +744,7 @@ class DocumentIR(StrictContractModel):
 
 
 class RenderJob(StrictContractModel):
-    """Recoverable two-phase file build job tracking (R2-P1-05 §5.3 & §7.1)."""
+    """Recoverable two-phase file build job tracking."""
 
     job_id: str
     render_id: str
@@ -796,7 +762,7 @@ class RenderJob(StrictContractModel):
     input_fingerprint: str
     temp_path: str = ""
     target_path: str = ""
-    output_sha256: str = ""
+    artifact_sha256: str = ""
     owner_pid: int | None = None
     heartbeat_at: str = Field(default_factory=utc_now_iso)
     lease_until: str = ""
@@ -806,7 +772,7 @@ class RenderJob(StrictContractModel):
 
 
 class RenderManifest(StrictContractModel):
-    """Snapshot-bound render manifest preventing stale exports (DAF-P0-04 §4.2 & R2-P1-05 §5.4)."""
+    """Snapshot-bound render manifest preventing stale exports."""
 
     render_id: str
     job_id: str = ""
@@ -819,36 +785,22 @@ class RenderManifest(StrictContractModel):
     profile_hash: str
     template_sha256: str = ""
     section_mapping_hash: str = ""
-    renderer_version: str = "daf-docx-ir-v2"
-    docx_path: str
-    artifact_path: str = ""
-    docx_sha256: str
-    output_sha256: str = ""
+    renderer_version: str = "daf-docx-pandoc-v2"
+    artifact_path: str
+    artifact_sha256: str
     artifact_status: Literal["committed", "stale", "superseded"] = "committed"
     omml_equations_count: int = 0
     tables_rendered: int = 0
     created_at: str = Field(default_factory=utc_now_iso)
 
-    @model_validator(mode="after")
-    def _sync_render_fields(self) -> "RenderManifest":
-        if self.docx_path and not self.artifact_path:
-            self.artifact_path = self.docx_path
-        elif self.artifact_path and not self.docx_path:
-            self.docx_path = self.artifact_path
-        if self.docx_sha256 and not self.output_sha256:
-            self.output_sha256 = self.docx_sha256
-        elif self.output_sha256 and not self.docx_sha256:
-            self.docx_sha256 = self.output_sha256
-        return self
-
 
 # ============================================================================
-# 6. Approvals (DAF-P0-02 & R2-P0-01) & Project Workspace State
+# 6. Approvals & Project Workspace State
 # ============================================================================
 
 
 class ApprovalDecision(StrictContractModel):
-    """Trusted human decision record written only by the trusted confirmation domain (R2-P0-01 §1.4 & §7.1)."""
+    """Trusted human decision record written only by the trusted confirmation domain."""
 
     request_id: str
     decision: Literal["approved", "rejected"]
@@ -865,7 +817,7 @@ class ApprovalDecision(StrictContractModel):
 
 
 class ApprovalRequest(StrictContractModel):
-    """Non-privileged approval request visible to external Agents without any secret token (R2-P0-01 §1.4 & §7.1)."""
+    """Non-privileged approval request visible to external Agents without any secret token."""
 
     approval_request_id: str
     project_id: str
@@ -901,8 +853,6 @@ class ApprovalRecord(StrictContractModel):
     ] = "local_cli"
     confirmed_by: str = "human_user"
     confirmed_at: str | None = None
-    approved_by: str = "human_user"
-    approved_at: str | None = None
     audit_id: str = ""
     invalidation_reason: str = ""
     comment: str = ""
@@ -917,10 +867,6 @@ class ApprovalRecord(StrictContractModel):
             )
         elif self.artifact_hash and not self.content_hash:
             self.content_hash = self.artifact_hash.removeprefix("sha256:")
-        if self.approved_at and not self.confirmed_at:
-            self.confirmed_at = self.approved_at
-        elif self.confirmed_at and not self.approved_at:
-            self.approved_at = self.confirmed_at
         return self
 
 
@@ -965,6 +911,5 @@ class ProjectWorkspaceState(StrictContractModel):
     render_jobs: dict[str, RenderJob] = Field(default_factory=dict)
     last_render_manifest: RenderManifest | None = None
     render_history: list[RenderManifest] = Field(default_factory=list)
-    last_rendered_docx_path: str | None = None
     last_exported_pdf_path: str | None = None
     last_exported_pdf_source_docx_sha256: str | None = None

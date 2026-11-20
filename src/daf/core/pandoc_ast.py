@@ -17,7 +17,7 @@ MIN_RECOMMENDED_PANDOC_VERSION: tuple[int, int, int] = (3, 2, 0)
 CROSSREF_PREFIXES: tuple[str, ...] = ("fig:", "tbl:", "eq:", "sec:")
 
 # R3: Physical & measurement units (trigger major when paired with a number).
-# Counting/planning units (年, 个, 项, 次, 章, 节, 人, 篇, ...) are explicitly excluded.
+# Counting/planning units (年, 个, 项, 次, 章, 节, 人, 篇,...) are explicitly excluded.
 PHYSICAL_UNITS: tuple[str, ...] = (
     "%",
     "％",
@@ -524,7 +524,7 @@ def classify_uncited_sentence(
 
 
 def sentence_needs_citation(sentence_text: str, extra_units: list[str] | None = None) -> bool:
-    """Boolean convenience wrapper around :func:`classify_uncited_sentence`."""
+    """Boolean convenience wrapper around:func:`classify_uncited_sentence`."""
     return classify_uncited_sentence(sentence_text, extra_units=extra_units) is not None
 
 

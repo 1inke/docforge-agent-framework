@@ -64,7 +64,7 @@ def run_cli_args(argv: list[str] | None = None) -> dict[str, Any]:
     p_guidance.add_argument("--section-id", default=None)
     p_guidance.add_argument("--max-guidance-chars", type=int, default=8000)
 
-    # Local user approval commands (P0-3)
+    # Local user approval commands
     p_appr = subparsers.add_parser("approvals", help="Local user approval management (list / show / decide).")
     appr_sub = p_appr.add_subparsers(dest="approvals_cmd", required=True)
 
@@ -84,14 +84,14 @@ def run_cli_args(argv: list[str] | None = None) -> dict[str, Any]:
     p_appr_decide.add_argument("--comment", type=str, default="")
     p_appr_decide.add_argument("--decided-by", type=str, default="local_user")
 
-    # Local user profile apply (P0-2A)
+    # Local user profile apply
     p_profile = subparsers.add_parser("profile", help="Local user profile commands.")
     prof_sub = p_profile.add_subparsers(dest="profile_cmd", required=True)
     p_prof_apply = prof_sub.add_parser("apply", help="Apply a workspace YAML profile to a project.")
     p_prof_apply.add_argument("--project-id", required=True)
     p_prof_apply.add_argument("--profile-id", required=True)
 
-    # Local user evidence reliability grading (P0-1)
+    # Local user evidence reliability grading
     p_ev = subparsers.add_parser("evidence", help="Local user evidence reliability commands.")
     ev_sub = p_ev.add_subparsers(dest="evidence_cmd", required=True)
     p_ev_trust = ev_sub.add_parser("trust", help="Set L3 reliability for an evidence item.")
@@ -99,7 +99,7 @@ def run_cli_args(argv: list[str] | None = None) -> dict[str, Any]:
     p_ev_trust.add_argument("--evidence-id", required=True)
     p_ev_trust.add_argument("--reliability", choices=["trusted", "conditional", "unassessed", "rejected"], default="trusted")
 
-    # Local user constraints (P0-2B)
+    # Local user constraints
     p_con = subparsers.add_parser("constraints", help="Local user constraints & forbidden scopes.")
     con_sub = p_con.add_subparsers(dest="constraints_cmd", required=True)
     p_con_add = con_sub.add_parser("add", help="Add user constraint / forbidden scope / conflict ack.")

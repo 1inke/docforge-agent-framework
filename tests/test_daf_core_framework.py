@@ -329,7 +329,7 @@ def test_end_to_end_template_agnostic_workflow(tmp_path: Path) -> None:
         engine.adopt_source_bibliography_by_user(project_id="proj_e2e", source_id=source_id)
 
         render_res = engine.render_document(project_id="proj_e2e", purpose="release")
-        assert Path(render_res["docx_path"]).exists()
+        assert Path(render_res["artifact_path"]).exists()
 
         export_res = engine.export_document(project_id="proj_e2e", purpose="release", export_pdf=False)
         assert export_res["is_official_release"] is True

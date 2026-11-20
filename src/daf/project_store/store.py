@@ -1,4 +1,4 @@
-"""Project Workspace & SQLite Atomic CAS State Store (split-table blob model, P1-1 & P1-4)."""
+"""Project Workspace & SQLite Atomic CAS State Store (split-table blob model)."""
 
 from __future__ import annotations
 
@@ -303,7 +303,7 @@ class ProjectStore:
         return project_dir
 
     # =========================================================================
-    # Content-Addressed Blob Extraction & Hydration (P1-1)
+    # Content-Addressed Blob Extraction & Hydration
     # =========================================================================
 
     def _put_blob_in_tx(
@@ -838,7 +838,7 @@ class ProjectStore:
             artifact_hash if artifact_hash.startswith("sha256:") else f"sha256:{artifact_hash}"
         )
 
-        # P1-4: Deduplicate pending request with identical (artifact_type, target_id, artifact_hash)
+        # Deduplicate pending request with identical (artifact_type, target_id, artifact_hash)
         for existing_req in state.approval_requests.values():
             if (
                 existing_req.artifact_type == artifact_type

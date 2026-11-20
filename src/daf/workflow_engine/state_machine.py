@@ -1,4 +1,4 @@
-"""Workflow State Machine, Context Fingerprint Enforcement, Trusted Human Approval Gates & L2a/L2b Verification (DAF-P0-01, DAF-P0-02, R2-P0-01, R2-P0-02, R2-P0-03 & R2-P1-06)."""
+"""Workflow State Machine, Context Fingerprint Enforcement, Trusted Human Approval Gates & L2a/L2b Verification."""
 
 from __future__ import annotations
 
@@ -99,9 +99,9 @@ def compute_final_draft_aggregate_hash(state: ProjectWorkspaceState) -> str:
 
 
 def assert_semantic_and_claim_reviews_ready(state: ProjectWorkspaceState) -> None:
-    """Enforce R2-P0-02 (accepted semantic reviews for current section revisions),
-    R2-P0-03 (secondary evidence revision & quote_hash consistency),
-    and R2-P1-06 (L2a passed + L2b supported_reviewed for all factual claims).
+    """Enforce (accepted semantic reviews for current section revisions),
+ (secondary evidence revision & quote_hash consistency),
+    and (L2a passed + L2b supported_reviewed for all factual claims).
     """
     SourcePolicyEvaluator.assert_document(state)
     # 1. Check that no drafted section is marked needs_revalidation
@@ -112,8 +112,7 @@ def assert_semantic_and_claim_reviews_ready(state: ProjectWorkspaceState) -> Non
     ]
     if stale_sections:
         has_stale_sem_task = any(
-            t.status in {"stale", "accepted"}
-            and (t.section_id in stale_sections or any(s in stale_sections for s in t.target_section_ids))
+            t.status in {"stale", "accepted"} and t.section_id in stale_sections
             for t in state.review_ledger.semantic_review_tasks
         )
         if has_stale_sem_task:
@@ -127,7 +126,7 @@ def assert_semantic_and_claim_reviews_ready(state: ProjectWorkspaceState) -> Non
             details={"stale_sections": stale_sections},
         )
 
-    # 2. First inspect all SourceBindings for L1/L2a/L3 and evidence version consistency (R2-P0-03 & R2-P1-06)
+    # 2. First inspect all SourceBindings for L1/L2a/L3 and evidence version consistency
     changed_evidence_bindings: list[dict[str, Any]] = []
     unsupported_bindings: list[dict[str, Any]] = []
     pending_l2b_bindings: list[dict[str, Any]] = []
@@ -161,7 +160,7 @@ def assert_semantic_and_claim_reviews_ready(state: ProjectWorkspaceState) -> Non
                 )
                 continue
 
-            # Secondary consistency check against live EvidenceItem & SourceDocumentRecord (R2-P0-03 §3.3 & T-R2-EVD-04)
+            # Secondary consistency check against live EvidenceItem & SourceDocumentRecord
             source_doc = state.source_registry.documents.get(ev.source_id)
             if (
                 ev.excerpt_match_status in {"source_stale", "stale"}
@@ -252,7 +251,7 @@ def assert_semantic_and_claim_reviews_ready(state: ProjectWorkspaceState) -> Non
             details={"blockers": blockers, "majors": majors},
         )
 
-    # 4. Verify each drafted section has an ACCEPTED SemanticReviewTask matching current revision, content_hash, and context_fingerprint (R2-P0-02 §2.5)
+    # 4. Verify each drafted section has an ACCEPTED SemanticReviewTask matching current revision, content_hash, and context_fingerprint
     unreviewed_sections: list[str] = []
     stale_reviewed_sections: list[str] = []
 
@@ -263,7 +262,7 @@ def assert_semantic_and_claim_reviews_ready(state: ProjectWorkspaceState) -> Non
         matching_tasks = [
             t
             for t in state.review_ledger.semantic_review_tasks
-            if (t.section_id == sid or sid in t.target_section_ids)
+            if t.section_id == sid
         ]
         if not matching_tasks:
             unreviewed_sections.append(sid)
@@ -314,9 +313,9 @@ def assert_semantic_and_claim_reviews_ready(state: ProjectWorkspaceState) -> Non
 
 
 def assert_release_ready(state: ProjectWorkspaceState) -> dict[str, Any]:
-    """Verify all mandatory conditions before allowing purpose='release' rendering or export (DAF-P0-02 & R2-P0-01..P1-06)."""
+    """Verify all mandatory conditions before allowing purpose='release' rendering or export."""
     SourcePolicyEvaluator.assert_document(state)
-    # 1. Outline approval gate (cannot be bypassed by mutating approval_policy, R2-P0-01 §1.3C)
+    # 1. Outline approval gate (cannot be bypassed by mutating approval_policy)
     outline_app = state.approvals.get("outline")
     if outline_app is None or outline_app.status != "approved":
         raise ApprovalConflictError(
@@ -327,11 +326,6 @@ def assert_release_ready(state: ProjectWorkspaceState) -> dict[str, Any]:
                 "project_id": state.brief.project_id,
                 "status": outline_app.status if outline_app else "missing",
             },
-        )
-    if outline_app.confirmed_via == "legacy_unverified":
-        raise UntrustedApprovalChannelError(
-            "Release blocked: outline approval lacks a verified human confirmation channel.",
-            details={"artifact_type": "outline"},
         )
     if (
         outline_app.approved_revision != state.outline_graph.outline_revision
@@ -442,11 +436,6 @@ def assert_release_ready(state: ProjectWorkspaceState) -> dict[str, Any]:
                 "status": final_app.status if final_app else "missing",
             },
         )
-    if final_app.confirmed_via == "legacy_unverified":
-        raise UntrustedApprovalChannelError(
-            "Release blocked: final_draft approval lacks a verified human confirmation channel.",
-            details={"artifact_type": "final_draft"},
-        )
     if final_app.content_hash != live_agg_hash:
         raise ApprovalConflictError(
             "Release blocked: final_draft approval hash does not match current document snapshot.",
@@ -505,9 +494,8 @@ class WorkflowEngine:
             else:
                 budget_origins[node.section_id] = "mixed"
 
-            # Validate resolved word budget (raises WordBudgetInvalidError on invalid bounds, R3-03 §2.2)
+            # Validate resolved word budget (raises WordBudgetInvalidError on invalid bounds)
             _, _, w_meta = resolve_section_word_budget(rule, node, None)
-            w_meta["legacy_budget_origin_unknown"] = False
             resolved_budgets[node.section_id] = w_meta
 
             for ev_id in node.assigned_evidence_ids:
@@ -600,22 +588,34 @@ class WorkflowEngine:
                 f"Submission project_id '{submission.project_id}' does not match workspace project_id '{state.brief.project_id}'."
             )
 
-        # 1. Check Outline Approval Gate when draft_mode == 'formal' (DAF-P0-02 §2.1 & R2-P0-01)
-        if submission.draft_mode == "formal":
-            outline_app = state.approvals.get("outline")
-            if (
-                outline_app is None
-                or outline_app.status != "approved"
-                or outline_app.content_hash != state.outline_graph.outline_hash
-            ):
-                raise ApprovalConflictError(
-                    f"Cannot submit formal draft for section '{section_id}' before the current outline is approved by the user. "
-                    "Obtain outline approval first, or set draft_mode='draft_preapproval' for a preliminary draft.",
-                    code="APPROVAL_REQUIRED",
+        # 1. Check Outline Approval Gate when draft_mode == 'formal'
+        outline_app = state.approvals.get("outline")
+        outline_approved = (
+            outline_app is not None
+            and outline_app.status == "approved"
+            and outline_app.content_hash == state.outline_graph.outline_hash
+        )
+        if submission.draft_mode == "formal" and not outline_approved:
+            raise ApprovalConflictError(
+                f"Cannot submit formal draft for section '{section_id}' before the current outline is approved by the user. "
+                "Obtain outline approval first, or set draft_mode='draft_preapproval' for a preliminary draft.",
+                code="APPROVAL_REQUIRED",
+                details={
+                    "project_id": state.brief.project_id,
+                    "section_id": section_id,
+                    "outline_revision": state.outline_graph.outline_revision,
+                },
+            )
+        if outline_approved and state.outline_graph.nodes:
+            outline_ids = [n.section_id for n in state.outline_graph.nodes]
+            if section_id not in outline_ids:
+                raise ContractValidationError(
+                    f"Section '{section_id}' is not declared in the approved outline.",
+                    code="SECTION_NOT_IN_OUTLINE",
                     details={
                         "project_id": state.brief.project_id,
                         "section_id": section_id,
-                        "outline_revision": state.outline_graph.outline_revision,
+                        "outline_section_ids": outline_ids,
                     },
                 )
 
@@ -643,7 +643,7 @@ class WorkflowEngine:
                 },
             )
 
-        # 4. Deterministic Context Fingerprint & context_revision check (DAF-P0-01 §1.3)
+        # 4. Deterministic Context Fingerprint & context_revision check
         _, live_ctx_fp, live_ctx_rev = ContextManager.compute_section_dependency_snapshot(
             state, section_id
         )
@@ -679,7 +679,7 @@ class WorkflowEngine:
 
         new_rev = current_rev + 1
 
-        # 6. Parse content_markdown via Pandoc JSON AST and derive bindings + L2a checks (P0-1)
+        # 6. Parse content_markdown via Pandoc JSON AST and derive bindings + L2a checks
         from daf.core.contracts import ReviewIssue
         from daf.core.pandoc_ast import (
             analyze_markdown_with_pandoc,
@@ -754,11 +754,10 @@ class WorkflowEngine:
                 false_markers = hypothesis_has_false_experiment_marker(sent.text)
                 if false_markers:
                     b_copy.rule_check_status = "rule_failed"
-                    b_copy.support_status = "unsupported"
+                    b_copy.semantic_support_status = "unsupported"
                     b_copy.rationale = (
                         f"Hypothesis sentence contains false experimental phrasing {false_markers}."
                     )
-                    b_copy.support_rationale = b_copy.rationale
                     l2_warnings.append(
                         {
                             "binding_id": bid,
@@ -769,7 +768,6 @@ class WorkflowEngine:
                     )
                 else:
                     sup_status, sup_reason = evaluate_claim_binding_support(b_copy, None)
-                    b_copy.support_rationale = sup_reason
                     b_copy.rationale = sup_reason
                 enriched_bindings.append(b_copy)
                 continue
@@ -802,10 +800,8 @@ class WorkflowEngine:
                     claim_type="research_hypothesis" if sent.is_hypothesis else "experimental_result",
                     evidence_quote_hash=ev.quote_hash,
                     semantic_support_status="pending",
-                    support_status="pending",
                 )
                 sup_status, sup_reason = evaluate_claim_binding_support(b_copy, ev)
-                b_copy.support_rationale = sup_reason
                 b_copy.rationale = sup_reason
                 if b_copy.rule_check_status == "rule_failed" or b_copy.support_status in {
                     "unsupported",
@@ -957,7 +953,7 @@ class WorkflowEngine:
                     )
                     invalidated_approvals.append(f"section:{other_id}")
 
-        # Invalidate semantic review tasks/reports for this section & downstream sections (R2-P0-02 §2.5)
+        # Invalidate semantic review tasks/reports for this section & downstream sections
         stale_sec_set = {section_id, *downstream_marked}
         for s_id in stale_sec_set:
             state.review_ledger.reviewed_section_revisions.pop(s_id, None)
@@ -965,8 +961,7 @@ class WorkflowEngine:
             if rep is not None:
                 rep.status = "stale"
         for task in state.review_ledger.semantic_review_tasks:
-            t_secs = set(task.target_section_ids) | ({task.section_id} if task.section_id else set())
-            if t_secs & stale_sec_set and task.status in {"pending", "claimed", "submitted", "accepted"}:
+            if task.section_id in stale_sec_set and task.status in {"pending", "claimed", "submitted", "accepted"}:
                 task.status = "stale"
                 task.stale_reason = f"Section '{section_id}' updated to revision {new_rev}."
 
@@ -1051,7 +1046,7 @@ class WorkflowEngine:
         target_id: str = "global",
         ttl_seconds: int = 3600,
     ) -> dict[str, Any]:
-        """Agent-callable non-privileged approval request (R2-P0-01 §1.3A).
+        """Agent-callable non-privileged approval request.
         Creates a pending ApprovalRequest and NEVER returns any secret confirmation token.
         """
         norm_target_id, rev, chash = cls.inspect_artifact_for_approval(
@@ -1088,7 +1083,7 @@ class WorkflowEngine:
         artifact_type: Literal["outline", "section", "final_draft"] | None = None,
         target_id: str = "global",
     ) -> dict[str, Any]:
-        """Agent-callable non-privileged status query for an ApprovalRequest (R2-P0-01 §1.3A)."""
+        """Agent-callable non-privileged status query for an ApprovalRequest."""
         req = None
         if approval_request_id is not None:
             req = state.approval_requests.get(approval_request_id)
@@ -1141,7 +1136,7 @@ class WorkflowEngine:
         confirmation_channel: Literal["local_ui", "local_cli"] = "local_cli",
         comment: str = "",
     ) -> dict[str, Any]:
-        """Trusted confirmation domain entrypoint to approve or reject a pending ApprovalRequest (R2-P0-01 §1.3B)."""
+        """Trusted confirmation domain entrypoint to approve or reject a pending ApprovalRequest."""
         req = state.approval_requests.get(approval_request_id)
         if req is None:
             raise ApprovalConflictError(
@@ -1197,8 +1192,6 @@ class WorkflowEngine:
             confirmed_via=confirmation_channel,
             confirmed_by=human_actor_id,
             confirmed_at=decision_rec.confirmed_at,
-            approved_by=human_actor_id,
-            approved_at=decision_rec.confirmed_at,
             audit_id=decision_rec.audit_id,
             comment=comment,
         )

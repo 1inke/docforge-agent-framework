@@ -1,4 +1,4 @@
-"""Unified Document Intermediate Representation (DocumentIR) Parser & Normalizer (DAF-P1-06 §6.2)."""
+"""Unified Document Intermediate Representation (DocumentIR) Parser & Normalizer."""
 
 from __future__ import annotations
 

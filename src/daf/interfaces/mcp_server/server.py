@@ -111,7 +111,7 @@ def create_mcp_server(
         template_path: str | None = None,
         is_agent_generated_summary: bool = False,
     ) -> dict[str, Any]:
-        """Ingest local source files (.md/.txt/.docx/.pdf) and optional .docx template within allowed roots."""
+        """Ingest local source files (.md/.txt/.docx/.pdf) and optional.docx template within allowed roots."""
         return _call(
             "ingest_sources",
             attach_next_action_for=project_id,
@@ -249,13 +249,13 @@ def create_mcp_server(
         base_revision: int,
         context_revision: str,
         idempotency_key: str,
+        author_session: str,
         content_markdown: str,
         summary: str,
         context_fingerprint: str = "",
         draft_mode: Literal["formal", "draft_preapproval"] = "formal",
-        author_session: str = "",
     ) -> dict[str, Any]:
-        """Commit section markdown; inline Pandoc citations [@ev_id]/[@hypothesis] are parsed and L2a-checked automatically."""
+        """Commit section markdown; requires an explicit author_session (>=3 chars); inline Pandoc citations are L2a-checked automatically."""
         payload = {
             "project_id": project_id,
             "section_id": section_id,
@@ -288,10 +288,10 @@ def create_mcp_server(
     @mcp.tool()
     def start_review(
         project_id: str,
+        reviewer_id: str,
         target_section_ids: list[str] | None = None,
-        reviewer_id: str = "reviewer_agent",
     ) -> dict[str, Any]:
-        """Run deterministic QA, create semantic review tasks, and claim them (must use an independent reviewer session)."""
+        """Run deterministic QA, create semantic review tasks, and claim them (must use an independent reviewer session >= 3 chars)."""
         return _call(
             "start_review",
             project_id=project_id,
@@ -308,9 +308,9 @@ def create_mcp_server(
         findings: list[dict[str, Any]],
         review_summary: str,
         recommendation: Literal["approve", "revise", "block"],
+        reviewed_by: str,
         checklist_results: list[dict[str, Any]],
         checklist_hash: str,
-        reviewed_by: str = "reviewer_agent",
         claim_evaluations: list[dict[str, Any]] | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:

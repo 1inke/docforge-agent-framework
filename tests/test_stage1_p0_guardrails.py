@@ -102,6 +102,7 @@ def test_p0_1_inline_citation_checks_ra_rb_rc_rd(tmp_path: Path) -> None:
                 "context_revision": ctx["context_revision"],
                 "context_fingerprint": ctx["context_fingerprint"],
                 "idempotency_key": "rc-1",
+                "author_session": "author-A",
                 "content_markdown": "Latency dropped to 9.2 ms[@ev_missing].",
                 "summary": "Missing evidence test.",
             }
@@ -232,7 +233,7 @@ def test_p0_2_profile_lock_agent_note_and_independent_review(tmp_path: Path) -> 
                     "check_id": item["check_id"],
                     "question": item["question"],
                     "verdict": "pass",
-                    "rationale": "Verified.",
+                    "rationale": "Verified metrics against benchmark excerpt in section.",
                     "quotes": ["This fabricated sentence does not exist in section text."],
                 }
                 for item in claimed["checklist_items"]
@@ -318,7 +319,7 @@ def test_p0_3_local_ui_token_and_stale_hash_and_cli_approvals(tmp_path: Path) ->
                 "check_id": item["check_id"],
                 "question": item["question"],
                 "verdict": "pass",
-                "rationale": "Verified.",
+                "rationale": "Verified metrics against live benchmark excerpt in section.",
                 "quotes": ["Baseline latency is 18.4 ms across 15 nodes"],
                 "evidence_ids": ["ev_01"],
             }

@@ -1,4 +1,4 @@
-"""Localhost-only (127.0.0.1) human review & approval UI with one-time session token (P0-3)."""
+"""Localhost-only (127.0.0.1) human review & approval UI with one-time session token."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from typing import Any, Literal
 from fastapi import FastAPI, Form, Header, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 
+from daf import __version__
 from daf.core.engine import DAFEngine
 from daf.core.errors import ApprovalConflictError, DAFError
 
@@ -32,7 +33,7 @@ def create_local_ui_app(
 
     app = FastAPI(
         title="DAF Local Approval Portal",
-        version="2.0.0",
+        version=__version__,
         docs_url=None,
         redoc_url=None,
     )
@@ -141,9 +142,10 @@ def create_local_ui_app(
                 f"<button type='submit'>Confirm CSL-JSON</button></form></li>"
             )
         sources_html = "".join(source_bib_rows)
+        last_art = state.last_render_manifest.artifact_path if state.last_render_manifest else None
         preview_link = (
             f"<p><a href='/projects/{_esc(project_id)}/preview-docx?token={_esc(token)}'>Download Preview DOCX</a></p>"
-            if state.last_rendered_docx_path and Path(state.last_rendered_docx_path).is_file()
+            if last_art and Path(last_art).is_file()
             else ""
         )
         body = f"""<!doctype html><html><head><meta charset='utf-8'><title>{_esc(project_id)}</title>
@@ -278,9 +280,10 @@ def create_local_ui_app(
     ) -> Any:
         _require_token(token_q, x_daf_ui_token)
         state = engine.store.load_state(project_id)
-        if not state.last_rendered_docx_path or not Path(state.last_rendered_docx_path).is_file():
+        last_art = state.last_render_manifest.artifact_path if state.last_render_manifest else None
+        if not last_art or not Path(last_art).is_file():
             raise HTTPException(status_code=404, detail="No rendered DOCX available.")
-        return FileResponse(path=state.last_rendered_docx_path, filename=Path(state.last_rendered_docx_path).name)
+        return FileResponse(path=last_art, filename=Path(last_art).name)
 
     return app, token
 

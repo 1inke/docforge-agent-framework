@@ -1,4 +1,4 @@
-"""Context Manager, Dependency Fingerprint Calculator, Versioned 3-Layer Evidence Verifier & L2a/L2b Claim Evaluator (DAF-P0-01, DAF-P1-05, R2-P0-03 & R2-P1-06)."""
+"""Context Manager, Dependency Fingerprint Calculator, Versioned 3-Layer Evidence Verifier & L2a/L2b Claim Evaluator."""
 
 from __future__ import annotations
 
@@ -132,7 +132,7 @@ def compute_canonical_json_hash(data: Any) -> str:
 
 
 def measure_serialized_json_chars(data: Any) -> int:
-    """Measure the exact UTF-8 decoded JSON character length using canonical formatting (R3-05 §4.2)."""
+    """Measure the exact UTF-8 decoded JSON character length using canonical formatting."""
     return len(json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
 
 
@@ -141,29 +141,18 @@ def resolve_section_word_budget(
     outline_node: OutlineNode | None,
     outline_graph: OutlineGraph | None = None,
 ) -> tuple[int, int, dict[str, Any]]:
-    """Resolve effective section word budget with explicit-override-only inheritance (R3-03 §2.2 & §2.3).
+    """Resolve effective section word budget with explicit-override-only inheritance.
 
-    Invariants:
     - Profile provides the default [min_words, max_words] range.
     - OutlineNode overrides min_words or max_words ONLY when explicitly provided (not None).
-    - Legacy pre-R3 projects where target_min_words=150, target_max_words=3500 were persisted without
-      word_budget_origins metadata retain their stored values (never silently rewritten) and are flagged
-      with `legacy_budget_origin_unknown=True`.
     """
+    _ = outline_graph
     default_min, default_max = 100, 4000
     profile_min = profile_rule.min_words if profile_rule is not None else default_min
     profile_max = profile_rule.max_words if profile_rule is not None else default_max
 
     explicit_min = outline_node.target_min_words if outline_node is not None else None
     explicit_max = outline_node.target_max_words if outline_node is not None else None
-
-    is_legacy_unknown = bool(
-        outline_node is not None
-        and explicit_min == 150
-        and explicit_max == 3500
-        and outline_graph is not None
-        and outline_node.section_id not in outline_graph.word_budget_origins
-    )
 
     min_words = explicit_min if explicit_min is not None else profile_min
     max_words = explicit_max if explicit_max is not None else profile_max
@@ -188,20 +177,16 @@ def resolve_section_word_budget(
             },
         )
 
-    if is_legacy_unknown:
-        min_source = "legacy_budget_origin_unknown"
-        max_source = "legacy_budget_origin_unknown"
-    else:
-        min_source = (
-            "outline"
-            if explicit_min is not None
-            else ("profile" if profile_rule is not None else "default")
-        )
-        max_source = (
-            "outline"
-            if explicit_max is not None
-            else ("profile" if profile_rule is not None else "default")
-        )
+    min_source = (
+        "outline"
+        if explicit_min is not None
+        else ("profile" if profile_rule is not None else "default")
+    )
+    max_source = (
+        "outline"
+        if explicit_max is not None
+        else ("profile" if profile_rule is not None else "default")
+    )
 
     return (
         min_words,
@@ -211,7 +196,6 @@ def resolve_section_word_budget(
             "max_words": max_words,
             "min_source": min_source,
             "max_source": max_source,
-            "legacy_budget_origin_unknown": is_legacy_unknown,
         },
     )
 
@@ -221,12 +205,12 @@ def run_claim_rule_checks(
     binding: SourceBinding,
     evidence: EvidenceItem | None,
 ) -> RuleCheckResult:
-    """Execute deterministic L2a rule checks on a SourceBinding (R2-P1-06 §6.3).
+    """Execute deterministic L2a rule checks on a SourceBinding.
 
     Invariant:
     - Passing deterministic rule checks ONLY returns `status="rule_passed"`, NEVER `"supported_reviewed"` or `"supported"`.
     - Quantitative values in `binding.claim_text` and `evidence.metrics_data` are checked strictly against
-      the verified `evidence.quote_excerpt` (never trusting ungrounded numbers in `metrics_data`, T-R2-CLM-03).
+      the verified `evidence.quote_excerpt` (never trusting ungrounded numbers in `metrics_data`).
     """
     b_id = binding.binding_id or "unnamed_binding"
     conflicts: list[str] = []
@@ -378,7 +362,7 @@ def record_semantic_support_review(
     ],
     rationale: str = "",
 ) -> SemanticSupportReview:
-    """Record an L2b semantic support review judgment on a SourceBinding (R2-P1-06 §6.3).
+    """Record an L2b semantic support review judgment on a SourceBinding.
 
     Invariant:
     - Cannot override `rule_check_status == "rule_failed"` with a positive `"supported_reviewed"` status.
@@ -389,12 +373,10 @@ def record_semantic_support_review(
 
     if rule_res.status == "rule_failed":
         binding.semantic_support_status = "unsupported"
-        binding.support_status = "unsupported"
         conflict_note = (
             f"Rule check conflict prevents positive semantic override: {rule_res.rationale}"
         )
         binding.rationale = conflict_note
-        binding.support_rationale = conflict_note
         raise ContractValidationError(
             conflict_note,
             code="CLAIM_SUPPORT_CONFLICT",
@@ -410,9 +392,6 @@ def record_semantic_support_review(
     ev_quote_hash = evidence.quote_hash if evidence else ""
 
     binding.semantic_support_status = semantic_status
-    binding.support_status = (
-        "supported" if semantic_status == "supported_reviewed" else semantic_status
-    )
     binding.reviewer = reviewer
     binding.reviewed_against_revision = section_revision
     binding.reviewed_against_section_hash = section_hash
@@ -422,7 +401,6 @@ def record_semantic_support_review(
         binding.evidence_quote_hash = ev_quote_hash
     final_rationale = rationale or f"L2b semantic review ({semantic_status}) by {reviewer}."
     binding.rationale = final_rationale
-    binding.support_rationale = final_rationale
 
     review_hash = compute_canonical_json_hash(
         {
@@ -461,7 +439,7 @@ def evaluate_claim_binding_support(
     ],
     str,
 ]:
-    """Evaluate combined L2a rule check + existing L2b review state (R2-P1-06).
+    """Evaluate combined L2a rule check + existing L2b review state.
 
     Crucial R2 Invariant:
     - If L2a fails -> returns `"unsupported"` (or `"stale"` if evidence is stale).
@@ -472,7 +450,6 @@ def evaluate_claim_binding_support(
     if evidence is not None and evidence.excerpt_match_status in {"source_stale", "stale"}:
         binding.rule_check_status = "rule_failed"
         binding.semantic_support_status = "stale"
-        binding.support_status = "stale"
         return ("stale", f"Referenced evidence '{evidence.evidence_id}' is stale due to source file update.")
 
     rule_res = run_claim_rule_checks(binding, evidence)
@@ -480,12 +457,10 @@ def evaluate_claim_binding_support(
 
     if rule_res.status == "rule_failed":
         binding.semantic_support_status = "unsupported"
-        binding.support_status = "unsupported"
         return ("unsupported", rule_res.rationale)
 
     if binding.claim_type == "research_hypothesis" and not binding.evidence_id:
         binding.semantic_support_status = "hypothesis_proposal"
-        binding.support_status = "hypothesis_proposal"
         return ("hypothesis_proposal", rule_res.rationale)
 
     # Check if an accepted L2b review already exists and matches current evidence version & quote_hash
@@ -497,10 +472,8 @@ def evaluate_claim_binding_support(
         and binding.evidence_quote_hash == evidence.quote_hash
     ):
         if binding.semantic_support_status == "supported_reviewed":
-            binding.support_status = "supported"
-            return ("supported", binding.support_rationale or "L2a passed and L2b semantic review accepted.")
-        binding.support_status = binding.semantic_support_status
-        return (binding.semantic_support_status, binding.support_rationale or rule_res.rationale)
+            return ("supported", binding.rationale or "L2a passed and L2b semantic review accepted.")
+        return (binding.semantic_support_status, binding.rationale or rule_res.rationale)
 
     # If evidence changed after review, mark stale
     if (
@@ -509,16 +482,14 @@ def evaluate_claim_binding_support(
         and binding.reviewed_against_evidence_fingerprint != evidence.evidence_fingerprint
     ):
         binding.semantic_support_status = "stale"
-        binding.support_status = "stale"
         return (
             "stale",
             f"Evidence '{evidence.evidence_id}' changed since binding was reviewed; requires re-review.",
         )
 
-    # Otherwise, L2a passed, awaiting L2b semantic review (R2-P1-06: never auto-promote to supported!)
+    # Otherwise, L2a passed, awaiting L2b semantic review (never auto-promote to supported)
     if binding.semantic_support_status not in {"partially_supported", "unsupported", "stale"}:
         binding.semantic_support_status = "pending"
-        binding.support_status = "pending"
     return (binding.support_status, rule_res.rationale)
 
 
@@ -579,7 +550,7 @@ class ContextManager:
         reason: str = "evidence_revision_changed",
     ) -> list[str]:
         """Cascade-invalidate all SourceBindings, SectionStates, downstream sections, semantic reviews, and approvals
-        that depend on `evidence_id` (R2-P0-03 §3.2).
+        that depend on `evidence_id`.
         """
         direct_sections: set[str] = set()
 
@@ -588,13 +559,11 @@ class ContextManager:
             for b in sec.source_bindings:
                 if b.evidence_id == evidence_id:
                     b.semantic_support_status = "stale"
-                    b.support_status = "stale"
                     b.reviewed_against_revision = None
                     b.reviewed_against_section_hash = ""
                     b.reviewed_against_evidence_fingerprint = ""
                     b.reviewed_evidence_revision = None
-                    b.support_rationale = f"Stale: bound evidence '{evidence_id}' changed ({reason})."
-                    b.rationale = b.support_rationale
+                    b.rationale = f"Stale: bound evidence '{evidence_id}' changed ({reason})."
                     touched = True
             if touched:
                 direct_sections.add(sec_id)
@@ -605,7 +574,7 @@ class ContextManager:
                 if sec_obj.revision > 0 and any(b.evidence_id == evidence_id for b in sec_obj.source_bindings):
                     direct_sections.add(node.section_id)
 
-        # Recursively find downstream sections via outline_graph.nodes.depends_on (T-R2-EVD-05)
+        # Recursively find downstream sections via outline_graph.nodes.depends_on
         all_affected: set[str] = set(direct_sections)
         frontier = list(direct_sections)
         while frontier:
@@ -636,8 +605,7 @@ class ContextManager:
                 sec_app.invalidation_reason = f"Evidence '{evidence_id}' changed ({reason})."
 
         for task in state.review_ledger.semantic_review_tasks:
-            task_secs = set(task.target_section_ids) | ({task.section_id} if task.section_id else set())
-            if task_secs & all_affected and task.status in {"pending", "claimed", "submitted", "accepted"}:
+            if task.section_id in all_affected and task.status in {"pending", "claimed", "submitted", "accepted"}:
                 task.status = "stale"
                 task.stale_reason = f"Evidence '{evidence_id}' changed ({reason})."
 
@@ -667,7 +635,7 @@ class ContextManager:
         doc_rec: SourceDocumentRecord,
         slices: list[SourceBlockSlice],
     ) -> list[str]:
-        """Register ingested source into state and cascade-invalidate any evidence/bindings if the source SHA changed (T-EVD-03 & R2-P0-03)."""
+        """Register ingested source into state and cascade-invalidate any evidence/bindings if the source SHA changed."""
         previous_doc = state.source_registry.documents.get(doc_rec.source_id)
         if previous_doc is None:
             for old_id, old_doc in list(state.source_registry.documents.items()):
@@ -715,7 +683,6 @@ class ContextManager:
                 )
                 ev.source_file_sha256 = doc_rec.file_sha256
                 ev.excerpt_match_status = "source_stale"
-                ev.verification_status = "unverified_excerpt"
                 ev.evidence_revision = old_rev + 1
                 ev.updated_at = datetime.now(timezone.utc).isoformat()
                 ev.updated_reason = f"source_sha_changed:{previous_doc.file_sha256[:8]}->{doc_rec.file_sha256[:8]}"
@@ -742,7 +709,7 @@ class ContextManager:
         *,
         allow_source_replacement: bool = False,
     ) -> dict[str, Any]:
-        """Register or update evidence items with versioning, idempotent no-op detection, and cascade invalidation (R2-P0-03)."""
+        """Register or update evidence items with versioning, idempotent no-op detection, and cascade invalidation."""
         verified_items: list[dict[str, Any]] = []
         rejected_items: list[dict[str, Any]] = []
         updated_evidence_ids: list[str] = []
@@ -766,7 +733,7 @@ class ContextManager:
                         },
                     )
                 if existing.evidence_fingerprint == ev_item.evidence_fingerprint:
-                    # Idempotent re-registration: preserve revision and timestamp, do not invalidate dependents (T-R2-EVD-03)
+                    # Idempotent re-registration: preserve revision and timestamp, do not invalidate dependents
                     ev_item.evidence_revision = existing.evidence_revision
                     ev_item.updated_at = existing.updated_at
                     ev_item.updated_reason = existing.updated_reason
@@ -960,7 +927,7 @@ class ContextManager:
         template_path: str | Path,
         allowed_roots: list[Path] | None = None,
     ) -> TemplateInspectionReport:
-        """Non-destructively inspect a .docx template for Jinja2 placeholders, headings, and table cells."""
+        """Non-destructively inspect a.docx template for Jinja2 placeholders, headings, and table cells."""
         resolved, raw_bytes = read_import_snapshot(template_path, allowed_roots, frozenset({".docx"}))
         if resolved.suffix.lower() != ".docx":
             raise ValueError(f"Template must be a .docx file, got '{resolved.name}'.")
@@ -1022,7 +989,7 @@ class ContextManager:
         state: ProjectWorkspaceState,
         raw_item: dict[str, Any],
     ) -> EvidenceItem:
-        """Verify L1 excerpt presence against SourceBlockSlice and set L3 source reliability (DAF-P1-05 & R2-P0-03)."""
+        """Verify L1 excerpt presence against SourceBlockSlice and set L3 source reliability."""
         evidence_id = validate_safe_identifier(str(raw_item["evidence_id"]), "evidence_id")
         source_id = validate_safe_identifier(str(raw_item["source_id"]), "source_id")
         SourcePolicyEvaluator.assert_source(state, source_id, "cite")
@@ -1056,7 +1023,6 @@ class ContextManager:
                 claim_summary=claim_summary,
                 quote_excerpt=quote_excerpt,
                 excerpt_match_status="not_matched",
-                verification_status="unverified_excerpt",
                 source_reliability=requested_reliability,  # type: ignore[arg-type]
                 source_file_sha256=source_sha,
                 quote_hash=quote_hash,
@@ -1071,17 +1037,15 @@ class ContextManager:
         norm_slice = source_slice.normalized_text or normalize_for_verification(source_slice.raw_text)
         if norm_excerpt and norm_excerpt in norm_slice:
             l1_status: Literal["matched", "not_matched"] = "matched"
-            v_status: Literal["verified", "unverified_excerpt"] = "verified"
             note = (
                 f"L1 excerpt matched in {slice_id} ({source_slice.locator}). "
                 "L1 confirms substring presence only; L2a rule check and L2b semantic support review run per section binding."
             )
         else:
             l1_status = "not_matched"
-            v_status = "unverified_excerpt"
             note = (
                 f"Excerpt could not be matched as a normalized substring of slice '{slice_id}' ({source_slice.locator}). "
-                "Marked as not_matched (unverified_excerpt)."
+                "Marked as not_matched."
             )
 
         return EvidenceItem(
@@ -1092,7 +1056,6 @@ class ContextManager:
             claim_summary=claim_summary,
             quote_excerpt=quote_excerpt,
             excerpt_match_status=l1_status,
-            verification_status=v_status,
             source_reliability=requested_reliability,  # type: ignore[arg-type]
             source_file_sha256=source_sha,
             quote_hash=quote_hash,
@@ -1102,12 +1065,12 @@ class ContextManager:
         )
 
     # ========================================================================
-    # R3-04 & R3-02: Source Block Listing, Windowed Reading, Search & Section Content
+    # Source Block Listing, Windowed Reading, Search & Section Content
     # ========================================================================
 
     @classmethod
     def compute_source_index_revision(cls, state: ProjectWorkspaceState) -> str:
-        """Compute a deterministic revision fingerprint over the current SourceRegistry (R3-04 §1.2)."""
+        """Compute a deterministic revision fingerprint over the current SourceRegistry."""
         ordered_docs = [
             {
                 "source_id": doc.source_id,
@@ -1176,7 +1139,7 @@ class ContextManager:
         page_size: int = 50,
         cursor: str | None = None,
     ) -> dict[str, Any]:
-        """Return stable, paginated directory and metadata of ingested SourceBlockSlices without full raw text (R3-04 §1.2A)."""
+        """Return stable, paginated directory and metadata of ingested SourceBlockSlices without full raw text."""
         if not isinstance(page_size, int) or page_size < 1 or page_size > 100:
             raise SourceQueryInvalidError(
                 f"Invalid page_size={page_size} for list_source_blocks; must be between 1 and 100.",
@@ -1254,7 +1217,7 @@ class ContextManager:
         max_chars: int = 6000,
         expected_sha256: str | None = None,
     ) -> dict[str, Any]:
-        """Return a character window `[start_char, end_char)` from an ingested SourceBlockSlice (R3-04 §1.2B)."""
+        """Return a character window `[start_char, end_char)` from an ingested SourceBlockSlice."""
         if not slice_id or not isinstance(slice_id, str):
             raise SourceQueryInvalidError("slice_id must be a non-empty string.")
         try:
@@ -1339,7 +1302,7 @@ class ContextManager:
         cursor: str | None = None,
         match_mode: str = "literal",
     ) -> dict[str, Any]:
-        """Perform local deterministic literal substring search across ingested SourceBlockSlices (R3-04 §1.2C)."""
+        """Perform local deterministic literal substring search across ingested SourceBlockSlices."""
         if not isinstance(query, str) or not query.strip():
             raise SourceQueryInvalidError(
                 "Search query must be a non-empty string.",
@@ -1468,7 +1431,7 @@ class ContextManager:
         max_chars: int = 8000,
         expected_revision: int | None = None,
     ) -> dict[str, Any]:
-        """Controlled windowed reader for drafted section prose during global_review or cross-section checking (R3-02 §3.2)."""
+        """Controlled windowed reader for drafted section prose during global_review or cross-section checking."""
         validate_safe_identifier(section_id, "section_id")
         if not isinstance(start_char, int) or start_char < 0:
             raise SourceQueryInvalidError(
@@ -1555,7 +1518,7 @@ class ContextManager:
         state: ProjectWorkspaceState,
         section_id: str,
     ) -> tuple[DependencySnapshot, str, str]:
-        """Compute deterministic, task-scoped DependencySnapshot, context_fingerprint, and context_revision (DAF-P0-01 & R3-03)."""
+        """Compute deterministic, task-scoped DependencySnapshot, context_fingerprint, and context_revision."""
         validate_safe_identifier(section_id, "section_id")
 
         profile_rule = next(
@@ -1584,7 +1547,7 @@ class ContextManager:
             else (list(profile_rule.depends_on) if profile_rule is not None else [])
         )
 
-        # Resolve effective word budget so profile or outline budget changes update context_fingerprint (R3-03 §2.3)
+        # Resolve effective word budget so profile or outline budget changes update context_fingerprint
         eff_min_w, eff_max_w, _ = resolve_section_word_budget(
             profile_rule, outline_node, state.outline_graph
         )
@@ -1725,7 +1688,7 @@ class ContextManager:
         default_token_budget: int,
         legacy_multiplier: int = 3,
     ) -> tuple[Literal["unicode_chars", "approx_chars"], int, bool, str, int]:
-        """Validate and resolve context budget parameters (R3-05 §4.2 & §4.3)."""
+        """Validate and resolve context budget parameters."""
         if token_budget is not None and max_context_chars is not None:
             raise ContextBudgetExceededError(
                 "Conflicting budget parameters: cannot pass both 'max_context_chars' and deprecated 'token_budget'. "
@@ -1778,7 +1741,7 @@ class ContextManager:
         conversion_formula: str,
         strict_core_limit: bool,
     ) -> dict[str, Any]:
-        """Pack variable list fields into `core_payload` while enforcing serialized JSON character limit (R3-05 §4.2)."""
+        """Pack variable list fields into `core_payload` while enforcing serialized JSON character limit."""
         working = dict(core_payload)
         for field_name, _ in variable_candidates:
             working[field_name] = []
@@ -1863,7 +1826,7 @@ class ContextManager:
         conversion_formula: str,
         strict_core_limit: bool,
     ) -> dict[str, Any]:
-        """Pure constructor for `task_type='plan_outline'` project context (R3-02 §3.2)."""
+        """Pure constructor for `task_type='plan_outline'` project context."""
         ordered_pairs = cls._ordered_project_slices(state)
         src_index_rev = cls.compute_source_index_revision(state)
 
@@ -2030,7 +1993,7 @@ class ContextManager:
         conversion_formula: str,
         strict_core_limit: bool,
     ) -> dict[str, Any]:
-        """Pure constructor for `task_type='global_review'` project context (R3-02 §3.2)."""
+        """Pure constructor for `task_type='global_review'` project context."""
         src_index_rev = cls.compute_source_index_revision(state)
         source_summaries = [
             {
@@ -2238,7 +2201,7 @@ class ContextManager:
         token_budget: int | None = None,
         max_context_chars: int | None = None,
     ) -> dict[str, Any]:
-        """Assemble task-aware, character-budgeted project context for `plan_outline` or `global_review` (R3-02 & R3-05)."""
+        """Assemble task-aware, character-budgeted project context for `plan_outline` or `global_review`."""
         if task_type not in {"plan_outline", "global_review"}:
             raise UnsupportedTaskTypeError(
                 f"Unsupported task_type '{task_type}'. Must be 'plan_outline' or 'global_review'.",
@@ -2283,7 +2246,7 @@ class ContextManager:
         token_budget: int | None = None,
         max_context_chars: int | None = None,
     ) -> SectionContextContract:
-        """Assemble a strictly typed, character-budgeted SectionContextContract with deterministic DependencySnapshot (DAF-P0-01, R3-03 & R3-05)."""
+        """Assemble a strictly typed, character-budgeted SectionContextContract with deterministic DependencySnapshot."""
         validate_safe_identifier(section_id, "section_id")
 
         unit, requested_limit, deprecated_used, formula, eff_token_budget = cls._resolve_context_budget_params(
@@ -2447,7 +2410,7 @@ class ContextManager:
 
         truncated_fields: list[str] = []
         if deprecated_used and not strict_core_limit:
-            # Legacy token_budget approximation mode (preserves T-CXT-05 behavior while reporting true measured_size)
+            # Legacy token_budget approximation mode (preserves behavior while reporting true measured_size)
             char_budget = max(40, requested_limit)
             used_chars = len(raw_current_markdown or "") + sum(len(u.summary) for u in upstream_deps)
             budgeted_evidence: list[EvidenceItem] = []
