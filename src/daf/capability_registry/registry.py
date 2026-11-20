@@ -421,64 +421,74 @@ class CapabilityRegistry:
         }
 
     @classmethod
-    def get_capabilities(cls, profile_id: str | None = None) -> dict[str, Any]:
+    def get_capabilities(
+        cls,
+        profile_id: str | None = None,
+        include_schemas: list[str] | None = None,
+        workspace_root: Any = None,
+    ) -> dict[str, Any]:
+        """Return a compact capability summary (< 3000 chars by default).
+
+        Pass ``include_schemas=[...]`` to fetch full Pydantic JSON schemas on demand.
+        """
+        all_schema_models: dict[str, Any] = {
+            "TaskGuidanceContract": TaskGuidanceContract,
+            "ProjectSourcePolicy": ProjectSourcePolicy,
+            "DocumentProfileContract": DocumentProfileContract,
+            "SectionContextContract": SectionContextContract,
+            "ContextBudgetMetadata": ContextBudgetMetadata,
+            "DependencySnapshot": DependencySnapshot,
+            "SectionSubmissionContract": SectionSubmissionContract,
+            "SemanticReviewReport": SemanticReviewReport,
+            "ChecklistItemSpec": ChecklistItemSpec,
+            "ChecklistItemResult": ChecklistItemResult,
+            "ApprovalRequest": ApprovalRequest,
+            "ReviewIssue": ReviewIssue,
+            "RenderManifest": RenderManifest,
+            "DocumentIR": DocumentIR,
+        }
+        compact_tools = [
+            "get_capabilities",
+            "get_task_guidance",
+            "create_project",
+            "get_project_status",
+            "ingest_sources",
+            "find_sources",
+            "read_source_block",
+            "register_evidence",
+            "submit_outline",
+            "get_section_context",
+            "submit_section",
+            "record_agent_note",
+            "start_review",
+            "submit_review",
+            "request_approval",
+            "render_document",
+            "export_document",
+        ]
         result: dict[str, Any] = {
             "framework_name": "DocForge Agent Framework (DAF)",
             "protocol_version": PROTOCOL_VERSION,
-            "architecture_mode": "agent_driven_framework_enforced",
-            "source_import_boundary": {"configuration_env": "DAF_ALLOWED_SOURCE_ROOTS", "format": "json_array",
-                                       "unconfigured": "deny", "empty_list": "deny", "template_uses_same_boundary": True},
-            "guidance": {"schema_version": "guidance.v1", "task_kinds": list(TEMPLATES),
-                         "external_lookup_available": False, "default_source_mode": "project_only"},
-            "supported_profiles": list_profile_summaries(),
-            "tools": TOOL_CATALOG,
-            "error_codes": ERROR_CODE_CATALOG,
-            "approval_gates": [
-                {
-                    "artifact_type": "outline",
-                    "description": "Requires human confirmation in the trusted confirmation portal before formal section drafting.",
-                    "binds_to": ["outline_revision", "outline_hash", "approval_request_id"],
-                },
-                {
-                    "artifact_type": "section",
-                    "description": "Optional per-section human confirmation bound to section revision and content_hash.",
-                    "binds_to": ["revision", "content_hash", "approval_request_id"],
-                },
-                {
-                    "artifact_type": "final_draft",
-                    "description": "Mandatory final approval gate over all required sections and accepted semantic reviews before purpose='release' render or export.",
-                    "binds_to": ["all_required_section_revisions", "aggregate_content_hash", "approval_request_id"],
-                },
+            "mode": "local_single_user_guardrail",
+            "source_import_env": "DAF_ALLOWED_SOURCE_ROOTS",
+            "task_kinds": list(TEMPLATES),
+            "supported_profiles": [
+                {"profile_id": p["profile_id"], "display_name": p["display_name"]}
+                for p in list_profile_summaries(workspace_root)
             ],
-            "concurrency_and_idempotency": {
-                "sqlite_atomic_cas": "All state mutations run in BEGIN IMMEDIATE transactions with state_version CAS.",
-                "optimistic_locking": "submit_section requires base_revision matching current section revision.",
-                "context_fingerprint": "submit_section requires context_revision matching current task-scoped DependencySnapshot.",
-                "idempotency": "submit_section deduplicates repeated calls with the same (idempotency_key, request_hash) and rejects payload reuse with IDEMPOTENCY_KEY_REUSED.",
-                "approval_invalidation": (
-                    "Any mutation to an approved outline, section, evidence item, or source file automatically invalidates its approval "
-                    "and marks downstream dependent sections as needs_revalidation=True."
-                ),
-            },
+            "tools": compact_tools,
+            "available_schemas": sorted(all_schema_models.keys()),
             "environment": cls.detect_environment(),
-            "contract_schemas": {
-                "TaskGuidanceContract": TaskGuidanceContract.model_json_schema(),
-                "ProjectSourcePolicy": ProjectSourcePolicy.model_json_schema(),
-                "DocumentProfileContract": DocumentProfileContract.model_json_schema(),
-                "SectionContextContract": SectionContextContract.model_json_schema(),
-                "ContextBudgetMetadata": ContextBudgetMetadata.model_json_schema(),
-                "DependencySnapshot": DependencySnapshot.model_json_schema(),
-                "SectionSubmissionContract": SectionSubmissionContract.model_json_schema(),
-                "SemanticReviewReport": SemanticReviewReport.model_json_schema(),
-                "ChecklistItemSpec": ChecklistItemSpec.model_json_schema(),
-                "ChecklistItemResult": ChecklistItemResult.model_json_schema(),
-                "ApprovalRequest": ApprovalRequest.model_json_schema(),
-                "ReviewIssue": ReviewIssue.model_json_schema(),
-                "RenderManifest": RenderManifest.model_json_schema(),
-                "DocumentIR": DocumentIR.model_json_schema(),
-            },
         }
+        if include_schemas:
+            if include_schemas == ["*"]:
+                selected = list(all_schema_models.keys())
+            else:
+                selected = [name for name in include_schemas if name in all_schema_models]
+            result["contract_schemas"] = {
+                name: all_schema_models[name].model_json_schema() for name in selected
+            }
         if profile_id is not None:
-            profile = get_document_profile(profile_id)
+            profile = get_document_profile(profile_id, workspace_root=workspace_root)
             result["requested_profile"] = profile.model_dump(mode="json")
         return result

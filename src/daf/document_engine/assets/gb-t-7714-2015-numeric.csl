@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0" default-locale="zh-CN">
+  <info>
+    <title>GB/T 7714-2015 (numeric, minimal built-in)</title>
+    <id>http://daf.local/styles/gb-t-7714-2015-numeric</id>
+    <updated>2026-11-20T00:00:00+00:00</updated>
+  </info>
+  <citation collapse="citation-number">
+    <layout prefix="[" suffix="]" delimiter=",">
+      <text variable="citation-number"/>
+    </layout>
+  </citation>
+  <bibliography entry-spacing="0" second-field-align="flush">
+    <layout>
+      <text variable="citation-number" prefix="[" suffix="] "/>
+      <names variable="author" suffix=". ">
+        <name initialize-with=" " delimiter=", "/>
+      </names>
+      <text variable="title" suffix=". "/>
+      <text variable="container-title" suffix=", "/>
+      <date variable="issued">
+        <date-part name="year"/>
+      </date>
+      <text variable="volume" prefix=", "/>
+      <text variable="issue" prefix="(" suffix=")"/>
+      <text variable="page" prefix=": "/>
+      <text value="."/>
+    </layout>
+  </bibliography>
+</style>

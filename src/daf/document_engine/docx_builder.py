@@ -741,38 +741,58 @@ class DocumentEngine:
 
         try:
             if effective_mode == "builtin":
-                doc = docx.Document()
-                cls.configure_document_styles(doc, layout)
-                cls._apply_preview_watermark_and_metadata(doc, purpose, eff_degradation, layout)
+                if eff_degradation == "strict" and pandoc_bin_override != "":
+                    from daf.document_engine.pandoc_renderer import render_document_single_pass_pandoc
 
-                if purpose == "preview":
-                    banner_p = doc.add_paragraph(PREVIEW_BANNER_TEXT)
+                    p_override = None if pandoc_bin_override == "AUTO" else pandoc_bin_override
+                    render_document_single_pass_pandoc(
+                        state=state,
+                        output_docx_path=tmp_output_path,
+                        purpose=purpose,
+                        project_dir=output_dir.parent,
+                        pandoc_bin=p_override,
+                    )
+                    doc = docx.Document(str(tmp_output_path))
+                    cls._apply_preview_watermark_and_metadata(doc, purpose, eff_degradation, layout)
                     total_runs_sanitized += enforce_run_font_uniformity(
-                        banner_p._p, layout.latin_font, layout.heading_cjk_font
+                        doc._body._body, layout.latin_font, layout.cjk_font
+                    )
+                    total_omml = sum(1 for _ in doc._body._body.iter(qn("m:oMath")))
+                    total_tables = len(doc.tables)
+                    doc.save(str(tmp_output_path))
+                else:
+                    doc = docx.Document()
+                    cls.configure_document_styles(doc, layout)
+                    cls._apply_preview_watermark_and_metadata(doc, purpose, eff_degradation, layout)
+
+                    if purpose == "preview":
+                        banner_p = doc.add_paragraph(PREVIEW_BANNER_TEXT)
+                        total_runs_sanitized += enforce_run_font_uniformity(
+                            banner_p._p, layout.latin_font, layout.heading_cjk_font
+                        )
+
+                    title_h = doc.add_heading(state.brief.title, level=0)
+                    total_runs_sanitized += enforce_run_font_uniformity(
+                        title_h._p, layout.latin_font, layout.heading_cjk_font
                     )
 
-                title_h = doc.add_heading(state.brief.title, level=0)
-                total_runs_sanitized += enforce_run_font_uniformity(
-                    title_h._p, layout.latin_font, layout.heading_cjk_font
-                )
+                    for ir_sec in ir.sections:
+                        sec_els, omml, tbls, san = cls.render_ir_section_to_elements(
+                            ir_sec,
+                            layout=layout,
+                            include_section_heading=True,
+                            degradation_mode=eff_degradation,
+                            pandoc_bin_override=pandoc_bin_override,
+                        )
+                        cls._insert_elements_into_body(doc._body._body, sec_els)
+                        total_omml += omml
+                        total_tables += tbls
+                        total_runs_sanitized += san
 
-                for ir_sec in ir.sections:
-                    sec_els, omml, tbls, san = cls.render_ir_section_to_elements(
-                        ir_sec,
-                        layout=layout,
-                        include_section_heading=True,
-                        degradation_mode=eff_degradation,
-                        pandoc_bin_override=pandoc_bin_override,
+                    total_runs_sanitized += enforce_run_font_uniformity(
+                        doc._body._body, layout.latin_font, layout.cjk_font
                     )
-                    cls._insert_elements_into_body(doc._body._body, sec_els)
-                    total_omml += omml
-                    total_tables += tbls
-                    total_runs_sanitized += san
-
-                total_runs_sanitized += enforce_run_font_uniformity(
-                    doc._body._body, layout.latin_font, layout.cjk_font
-                )
-                doc.save(str(tmp_output_path))
+                    doc.save(str(tmp_output_path))
 
             elif effective_mode == "tagged":
                 assert template_path is not None

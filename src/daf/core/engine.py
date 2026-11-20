@@ -88,8 +88,16 @@ class DAFEngine:
         self.allowed_source_roots = resolve_source_roots(allowed_source_roots)
 
     # 1. get_capabilities
-    def get_capabilities(self, profile_id: str | None = None) -> dict[str, Any]:
-        return CapabilityRegistry.get_capabilities(profile_id=profile_id)
+    def get_capabilities(
+        self,
+        profile_id: str | None = None,
+        include_schemas: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return CapabilityRegistry.get_capabilities(
+            profile_id=profile_id,
+            include_schemas=include_schemas,
+            workspace_root=self.workspace_root,
+        )
 
     # 2. get_document_profile
     def get_document_profile(self, profile_id: str) -> dict[str, Any]:
@@ -1530,6 +1538,55 @@ class DAFEngine:
         return self.store.transact_project(project_id, "export_document", _export_mutator)
 
     # Unified Agent Tool Dispatcher (enforces non-privileged Agent domain boundary, R2-P0-01)
+    # Unified compact helpers for streamlined MCP tool surface (P2-A)
+    def find_sources(
+        self,
+        project_id: str,
+        query: str | None = None,
+        source_id: str | None = None,
+        source_ids: list[str] | None = None,
+        page_size: int = 20,
+        cursor: str | None = None,
+        match_mode: str = "literal",
+    ) -> dict[str, Any]:
+        if query:
+            ids = source_ids or ([source_id] if source_id else None)
+            return self.search_sources(
+                project_id=project_id,
+                query=query,
+                source_ids=ids,
+                page_size=page_size,
+                cursor=cursor,
+                match_mode=match_mode,
+            )
+        return self.list_source_blocks(
+            project_id=project_id,
+            source_id=source_id,
+            page_size=page_size,
+            cursor=cursor,
+        )
+
+    def start_review(
+        self,
+        project_id: str,
+        target_section_ids: list[str] | None = None,
+        reviewer_id: str = "reviewer_agent",
+    ) -> dict[str, Any]:
+        """Run deterministic QA, create semantic review tasks, and claim them in one call."""
+        rev_out = self.review_document(project_id=project_id, target_section_ids=target_section_ids)
+        claimed_tasks: list[dict[str, Any]] = []
+        for t in rev_out.get("semantic_review_tasks", []):
+            if t.get("status") in {"pending", "claimed"}:
+                claimed_tasks.append(
+                    self.claim_semantic_review_task(
+                        project_id=project_id,
+                        task_id=t["task_id"],
+                        reviewer_id=reviewer_id,
+                    )
+                )
+        rev_out["claimed_tasks"] = claimed_tasks
+        return rev_out
+
     def call_agent_tool(self, tool_name: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """Dispatch a tool call from an external Agent (MCP / CLI `call` / HTTP `/api/v1/tools/{tool_name}`).
         Strictly blocks any attempt by an Agent to call trusted human confirmation methods or mint tokens.
@@ -1554,7 +1611,9 @@ class DAFEngine:
             "get_source_policy": self.get_source_policy,
             "create_project": self.create_project,
             "ingest_sources": self.ingest_sources,
+            "find_sources": self.find_sources,
             "list_source_blocks": self.list_source_blocks,
+            "read_source_block": self.get_source_block,
             "get_source_block": self.get_source_block,
             "search_sources": self.search_sources,
             "register_evidence": self.register_evidence,
@@ -1563,9 +1622,11 @@ class DAFEngine:
             "get_section_context": self.get_section_context,
             "get_section_content": self.get_section_content,
             "submit_section": self.submit_section,
+            "start_review": self.start_review,
             "review_document": self.review_document,
             "list_semantic_review_tasks": self.list_semantic_review_tasks,
             "claim_semantic_review_task": self.claim_semantic_review_task,
+            "submit_review": self.submit_semantic_review,
             "submit_semantic_review": self.submit_semantic_review,
             "get_revision_tasks": self.get_revision_tasks,
             "record_agent_note": self.record_agent_note,
