@@ -1,0 +1,8 @@
+major|时延降低 50%。
+major|吞吐量达到 3.2 GB/s。
+major|实验表明时延降低到 5 ms。
+major|内存占用减少至 256 MB。
+major|Latency dropped to 4.1 ms under steady load.
+minor|本方法优于现有方法。
+minor|首次实现高精度密集人群识别。
+minor|The proposed scheduler outperforms FIFO baselines.

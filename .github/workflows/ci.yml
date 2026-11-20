@@ -12,8 +12,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - name: Install pandoc
-        run: sudo apt-get update && sudo apt-get install -y pandoc
+      - name: Install pandoc 3.6.4
+        run: |
+          curl -fsSL https://github.com/jgm/pandoc/releases/download/3.6.4/pandoc-3.6.4-1-amd64.deb -o /tmp/pandoc.deb
+          sudo dpkg -i /tmp/pandoc.deb
+          rm -f /tmp/pandoc.deb
+          pandoc --version
       - name: Sync dependencies
         run: uv sync --dev
       - name: Lint new & core checks

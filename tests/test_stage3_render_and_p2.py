@@ -19,6 +19,7 @@ from daf.core.pandoc_ast import (
 )
 from daf.document_engine.pandoc_renderer import render_document_single_pass_pandoc
 from daf.interfaces.mcp_server.server import create_mcp_server
+from tests.helpers import assert_clean_rendered_docx
 
 
 def test_p1_3_single_pass_pandoc_render_with_csl_omml_and_crossref(
@@ -63,9 +64,11 @@ sections:
     ing = engine.ingest_sources(project_id="ren_p", source_paths=[str(src_file)])
     src_id = ing["ingested_sources"][0]["source_id"]
 
-    # Attach CSL-JSON bibliography to source document
-    def _attach_bib(state, _conn):
-        state.source_registry.documents[src_id].bibliography = {
+    # Attach CSL-JSON bibliography via user governance API
+    engine.set_source_bibliography_by_user(
+        "ren_p",
+        src_id,
+        {
             "type": "article-journal",
             "title": "Copper Single-Atom Catalysts for CO2 Reduction",
             "author": [{"family": "Zhang", "given": "Wei"}],
@@ -73,10 +76,8 @@ sections:
             "issued": {"date-parts": [[2025]]},
             "volume": "420",
             "page": "101-112",
-        }
-        return {}, "Attached bibliography", {}
-
-    engine.store.transact_project("ren_p", "attach_bib", _attach_bib)
+        },
+    )
     sl = engine.list_source_blocks(project_id="ren_p", source_id=src_id)["blocks"][0]
     engine.register_evidence(
         project_id="ren_p",
@@ -152,6 +153,7 @@ sections:
     assert len(doc.tables) >= 1
     assert "[1]" in full_text
     assert "Copper Single-Atom Catalysts" in full_text
+    assert_clean_rendered_docx(out_docx, expected_bib_count=1)
 
 
 def test_p2_capabilities_budget_and_mcp_unified_error_and_next_action(tmp_path: Path) -> None:

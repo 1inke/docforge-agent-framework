@@ -146,7 +146,7 @@ class ReviewManager:
             iss
             for iss in state.review_ledger.issues
             if iss.status == "resolved"
-            or iss.category == "user_feedback"
+            or iss.category in {"user_feedback", "UNCITED_FACTUAL_CLAIM"}
             or (iss.target_section_id not in sections_to_check and iss.target_section_id is not None)
         ]
 

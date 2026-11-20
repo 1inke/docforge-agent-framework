@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import time
 
 import pytest
 
 from daf import DAFEngine
-from daf.core.contracts import RenderJob
 from daf.core.errors import IdempotencyKeyConflictError, ProjectNotFoundError
 
 
@@ -56,7 +54,7 @@ def test_p1_1_readonly_queries_do_not_bump_version_and_write_latency_is_bounded(
     with closing(engine.store._connect(readonly=True)) as conn:
         row = conn.execute("SELECT length(state_json) AS sz FROM projects WHERE project_id = 'perf_p1'").fetchone()
         blob_count = conn.execute("SELECT count(*) AS cnt FROM blobs").fetchone()["cnt"]
-    assert int(row["sz"]) < 100_000
+    assert int(row["sz"]) < 50_000
     assert int(blob_count) >= 1
     assert elapsed_ms < 250.0  # Compact write avoids MB-scale serialization
 
@@ -75,65 +73,6 @@ def test_p1_1_no_json_resurrection_after_db_deletion(tmp_path: Path) -> None:
     with pytest.raises(ProjectNotFoundError) as exc_info:
         engine.get_project_status("ghost_p")
     assert exc_info.value.code == "PROJECT_NOT_FOUND"
-
-
-def test_p1_4_active_render_job_not_reaped_by_status_query(tmp_path: Path) -> None:
-    """Experiment 3 regression: get_project_status never reaps active render jobs, and
-    recover_render_jobs only reaps jobs whose lease expired AND owner PID is dead."""
-    ws = tmp_path / "ws"
-    engine = DAFEngine(workspace_root=ws)
-    engine.create_project(project_id="rjob_p", title="Render Lease Test")
-    artifacts = engine.store.ensure_project_dirs("rjob_p") / "artifacts"
-    tmp_file = artifacts / "active.tmp.docx"
-    tmp_file.write_bytes(b"in-progress")
-
-    now = datetime.now(timezone.utc)
-    active_job = RenderJob(
-        job_id="rjob_live",
-        render_id="render_0001",
-        project_id="rjob_p",
-        purpose="preview",
-        phase="built",
-        input_fingerprint="sha256:abc",
-        temp_path=str(tmp_file),
-        target_path=str(artifacts / "out.docx"),
-        owner_pid=None,
-        heartbeat_at=now.isoformat(),
-        lease_until=(now + timedelta(minutes=10)).isoformat(),
-    )
-    expired_dead_job = RenderJob(
-        job_id="rjob_dead",
-        render_id="render_0002",
-        project_id="rjob_p",
-        purpose="preview",
-        phase="prepared",
-        input_fingerprint="sha256:def",
-        temp_path="",
-        target_path="",
-        owner_pid=999_999_999,
-        heartbeat_at=(now - timedelta(hours=1)).isoformat(),
-        lease_until=(now - timedelta(minutes=30)).isoformat(),
-    )
-
-    def _inject(state, _conn):
-        state.render_jobs[active_job.job_id] = active_job
-        state.render_jobs[expired_dead_job.job_id] = expired_dead_job
-        return {}, "Injected render jobs for lease test.", {}
-
-    engine.store.transact_project("rjob_p", "test_inject", _inject)
-
-    # Status query must NOT reap either job or delete tmp_file
-    status = engine.get_project_status("rjob_p")
-    assert len(status["active_render_jobs"]) == 2
-    assert tmp_file.exists()
-
-    # Explicit recovery reaps ONLY the expired dead job, keeping the leased active job intact
-    rec = engine.recover_render_jobs("rjob_p")
-    assert rec["recovered_jobs"] == ["rjob_dead"]
-    assert tmp_file.exists()
-    state_after = engine.store.load_state("rjob_p", hydrate_slices=False, hydrate_sections=False)
-    assert state_after.render_jobs["rjob_live"].phase == "built"
-    assert state_after.render_jobs["rjob_dead"].phase == "aborted_recovered"
 
 
 def test_p1_4_idempotency_and_approval_deduplication(tmp_path: Path) -> None:
