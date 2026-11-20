@@ -1003,11 +1003,7 @@ class WorkflowEngine:
         approval_request_id: str,
         decision: Literal["approved", "rejected"],
         human_actor_id: str = "human_user",
-        confirmation_channel: Literal[
-            "trusted_human_portal",
-            "trusted_local_ui",
-            "trusted_host_callback",
-        ] = "trusted_human_portal",
+        confirmation_channel: Literal["local_ui", "local_cli"] = "local_cli",
         comment: str = "",
     ) -> dict[str, Any]:
         """Trusted confirmation domain entrypoint to approve or reject a pending ApprovalRequest (R2-P0-01 §1.3B)."""
@@ -1089,102 +1085,6 @@ class WorkflowEngine:
             "approval_record": record.model_dump(mode="json"),
             "decision": decision_rec.model_dump(mode="json"),
         }
-
-    @classmethod
-    def approve_artifact(
-        cls,
-        state: ProjectWorkspaceState,
-        artifact_type: Literal["outline", "section", "final_draft"],
-        target_id: str = "global",
-        approved_by: str = "human_user",
-        expected_revision: int | None = None,
-        expected_hash: str | None = None,
-        confirmation_token: str | None = None,
-        store: ProjectStore | None = None,
-        conn: sqlite3.Connection | None = None,
-        comment: str = "",
-    ) -> dict[str, Any]:
-        """Internal trusted token verification entrypoint (NOT exposed as an Agent MCP tool, R2-P0-01 §7.2)."""
-        now_iso = datetime.now(timezone.utc).isoformat()
-        norm_target_id, rev, chash = cls.inspect_artifact_for_approval(
-            state,
-            artifact_type,
-            target_id,
-            require_semantic_review_for_final=True,
-        )
-
-        if expected_revision is not None and expected_revision != rev:
-            raise ApprovalConflictError(
-                f"{artifact_type} approval revision mismatch: expected {expected_revision}, actual {rev}.",
-                code="APPROVAL_STALE",
-                details={"expected_revision": expected_revision, "actual_revision": rev},
-            )
-        if expected_hash is not None and expected_hash.removeprefix("sha256:") != chash.removeprefix("sha256:"):
-            raise ApprovalConflictError(
-                f"{artifact_type} approval hash mismatch: expected {expected_hash}, actual {chash}.",
-                code="APPROVAL_STALE",
-                details={"expected_hash": expected_hash, "actual_hash": chash},
-            )
-
-        if not confirmation_token or not confirmation_token.strip():
-            raise UntrustedApprovalChannelError(
-                "Approval rejected: a verifiable one-time 'confirmation_token' from the trusted domain is required. "
-                "Passing approved_by='user' without a confirmation token cannot bypass human confirmation.",
-                details={
-                    "project_id": state.brief.project_id,
-                    "artifact_type": artifact_type,
-                    "target_id": norm_target_id,
-                    "current_revision": rev,
-                    "current_hash": chash,
-                },
-            )
-
-        if store is None or conn is None:
-            raise UntrustedApprovalChannelError(
-                "Internal store transaction required to verify confirmation_token."
-            )
-
-        verified_channel = store.consume_approval_token_in_tx(
-            conn=conn,
-            token=confirmation_token.strip(),
-            project_id=state.brief.project_id,
-            artifact_type=artifact_type,
-            target_id=norm_target_id,
-            expected_revision=rev,
-            expected_hash=chash,
-        )
-
-        if artifact_type == "outline":
-            gate_key = "outline"
-            if state.stage == "outline_pending_approval":
-                state.stage = "outline_approved"
-        elif artifact_type == "section":
-            gate_key = f"section:{norm_target_id}"
-            sec = state.section_versions.sections[norm_target_id]
-            sec.needs_revalidation = False
-            sec.stale_reason = ""
-        else:
-            gate_key = "final_draft"
-            state.stage = "final_approved"
-
-        approval_id = f"appr_{len(state.approvals) + 1:03d}_{rev}"
-        record = ApprovalRecord(
-            approval_id=approval_id,
-            artifact_type=artifact_type,
-            target_id=norm_target_id,
-            status="approved",
-            approved_revision=rev,
-            content_hash=chash,
-            artifact_hash=f"sha256:{chash}",
-            confirmed_via=verified_channel,  # type: ignore[arg-type]
-            confirmed_by=approved_by,
-            confirmed_at=now_iso,
-            approved_by=approved_by,
-            approved_at=now_iso,
-            comment=comment,
-        )
-        state.approvals[gate_key] = record
-        return record.model_dump(mode="json")
 
     @classmethod
     def submit_feedback(

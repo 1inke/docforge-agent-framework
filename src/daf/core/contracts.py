@@ -41,16 +41,6 @@ class ProjectSourcePolicy(StrictContractModel):
     approved_at: str | None = None
 
 
-class SourcePolicyChangeRequest(StrictContractModel):
-    request_id: str
-    base_revision: int
-    proposed_policy: ProjectSourcePolicy
-    reason: str = Field(min_length=1)
-    status: Literal["pending", "approved", "rejected", "stale"] = "pending"
-    decided_by: str | None = None
-    decided_at: str | None = None
-
-
 class GuidanceInstruction(StrictContractModel):
     id: str
     level: Literal["advisory", "contract", "enforced"]
@@ -540,19 +530,11 @@ class SemanticReviewReport(StrictContractModel):
     claim_evaluations: list[dict[str, Any]] = Field(default_factory=list)
     checklist_hash: str = ""
     checklist_results: list[ChecklistItemResult] = Field(default_factory=list)
-    checklist_verification_mode: Literal["structured_verified", "legacy_unstructured"] = "legacy_unstructured"
+    checklist_verification_mode: Literal["structured_verified"] = "structured_verified"
     submitted_at: str = Field(default_factory=utc_now_iso)
     accepted_at: str | None = None
     policy_version: str = "v1"
     status: Literal["submitted", "accepted", "rejected", "stale"] = "submitted"
-
-    @model_validator(mode="after")
-    def _sync_checklist_verification_mode(self) -> "SemanticReviewReport":
-        if self.checklist_results:
-            self.checklist_verification_mode = "structured_verified"
-        elif not self.checklist_results and not self.checklist_hash:
-            self.checklist_verification_mode = "legacy_unstructured"
-        return self
 
 
 class SemanticReviewTask(StrictContractModel):
@@ -859,10 +841,9 @@ class ApprovalDecision(StrictContractModel):
     decision: Literal["approved", "rejected"]
     human_actor_id: str
     confirmation_channel: Literal[
-        "trusted_human_portal",
-        "trusted_local_ui",
-        "trusted_host_callback",
-    ] = "trusted_human_portal"
+        "local_ui",
+        "local_cli",
+    ] = "local_cli"
     confirmed_at: str = Field(default_factory=utc_now_iso)
     artifact_revision: int
     artifact_hash: str
@@ -902,14 +883,9 @@ class ApprovalRecord(StrictContractModel):
     content_hash: str = ""
     artifact_hash: str = ""
     confirmed_via: Literal[
-        "trusted_human_portal",
-        "trusted_local_ui",
-        "trusted_host_callback",
-        "local_confirmation_token",
-        "trusted_local_cli",
-        "test_harness_token",
-        "legacy_unverified",
-    ] = "trusted_human_portal"
+        "local_ui",
+        "local_cli",
+    ] = "local_cli"
     confirmed_by: str = "human_user"
     confirmed_at: str | None = None
     approved_by: str = "human_user"
@@ -964,9 +940,7 @@ class ProjectWorkspaceState(StrictContractModel):
     ] = "initialized"
     updated_at: str = Field(default_factory=utc_now_iso)
     source_registry: SourceRegistry = Field(default_factory=SourceRegistry)
-    # Missing in old SQLite JSON means an explicit legacy_unconfigured read view.
-    source_policy: ProjectSourcePolicy | None = None
-    source_policy_requests: dict[str, SourcePolicyChangeRequest] = Field(default_factory=dict)
+    source_policy: ProjectSourcePolicy = Field(default_factory=ProjectSourcePolicy)
     evidence_ledger: EvidenceLedger = Field(default_factory=EvidenceLedger)
     outline_graph: OutlineGraph = Field(default_factory=OutlineGraph)
     terminology: TerminologyRegistry = Field(default_factory=TerminologyRegistry)

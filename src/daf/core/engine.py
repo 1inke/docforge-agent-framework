@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import os
 import sqlite3
@@ -22,7 +21,6 @@ from daf.core.contracts import (
     RenderJob,
     RenderManifest,
     SectionSubmissionContract,
-    SourcePolicyChangeRequest,
 )
 from daf.core.errors import (
     ArtifactPathInvalidError,
@@ -42,10 +40,9 @@ from daf.document_profiles.profiles import (
     get_document_profile,
 )
 from daf.guidance.builder import TaskGuidanceBuilder
-from daf.guidance.policy import SourcePolicyEvaluator, compute_source_policy_signature
+from daf.guidance.policy import SourcePolicyEvaluator
 from daf.project_store.store import (
     ProjectStore,
-    compute_human_portal_signature,
     validate_safe_docx_filename,
     validate_safe_identifier,
 )
@@ -67,15 +64,11 @@ class DAFEngine:
         self,
         workspace_root: str | Path | None = None,
         allowed_source_roots: list[str | Path] | None = None,
-        human_portal_secret: str | None = None,
     ) -> None:
         default_root = os.environ.get("DAF_WORKSPACE_ROOT") or str(Path.cwd() / ".daf_workspace")
         self.workspace_root = Path(workspace_root or default_root).resolve()
         self.store = ProjectStore(self.workspace_root)
         self.allowed_source_roots = resolve_source_roots(allowed_source_roots)
-        self.human_portal_secret: str | None = human_portal_secret or os.environ.get(
-            "DAF_HUMAN_PORTAL_SECRET"
-        )
 
     # 1. get_capabilities
     def get_capabilities(self, profile_id: str | None = None) -> dict[str, Any]:
@@ -167,95 +160,65 @@ class DAFEngine:
 
     def get_source_policy(self, project_id: str) -> dict[str, Any]:
         state = self.store.load_state(project_id)
-        return {"project_id": project_id, **SourcePolicyEvaluator.public_policy(state),
-                "change_requests": [r.model_dump(mode="json") for r in state.source_policy_requests.values()]}
+        return {"project_id": project_id, **SourcePolicyEvaluator.public_policy(state)}
 
-    def propose_source_policy_change(
-        self, project_id: str, proposed_policy: dict[str, Any], reason: str,
+    def set_source_policy_by_user(
+        self,
+        project_id: str,
+        policy: dict[str, Any],
+        reason: str = "Updated by local user",
+        updated_by: str = "local_user",
     ) -> dict[str, Any]:
-        if not reason.strip():
-            raise ContractValidationError("来源策略变更必须说明原因。")
+        """Directly update project source policy from local UI/CLI (not exposed to Agents)."""
         try:
-            policy = ProjectSourcePolicy.model_validate(proposed_policy)
+            validated = ProjectSourcePolicy.model_validate(policy)
         except ValueError as exc:
-            raise PolicyConflictError("来源策略契约无效，不可禁用证据登记。") from exc
-        if policy.mode == "project_only" and policy.external_lookup_enabled:
-            raise PolicyConflictError("project_only 不允许外部检索授权。")
+            raise PolicyConflictError("Invalid source policy contract.") from exc
+        if validated.mode == "project_only" and validated.external_lookup_enabled:
+            raise PolicyConflictError("project_only does not allow external_lookup_enabled.")
 
         def _mutator(state: ProjectWorkspaceState, _conn: sqlite3.Connection) -> tuple[dict[str, Any], str, dict[str, Any]]:
-            current = SourcePolicyEvaluator.revision(state)
-            policy.revision = current + 1
-            policy.updated_by = "pending_human_decision"
-            policy.approved_at = None
-            policy.reason = reason.strip()
-            for req in state.source_policy_requests.values():
-                if req.status == "pending" and req.base_revision == current and req.proposed_policy == policy:
-                    return req.model_dump(mode="json"), "Reused pending source policy request.", {"request_id": req.request_id}
-            req = SourcePolicyChangeRequest(
-                request_id=f"spreq_{uuid.uuid4().hex}", base_revision=current,
-                proposed_policy=policy, reason=reason.strip(),
-            )
-            state.source_policy_requests[req.request_id] = req
-            return req.model_dump(mode="json"), "Proposed source policy change; awaiting trusted human decision.", {"request_id": req.request_id}
-
-        return self.store.transact_project(project_id, "propose_source_policy_change", _mutator)
-
-    def trusted_decide_source_policy_change(
-        self, project_id: str, request_id: str, decision: Literal["approved", "rejected"],
-        decided_by: str = "human_user", portal_signature: str | None = None,
-    ) -> dict[str, Any]:
-        """Request-bound, signed confirmation. Never part of the Agent dispatcher."""
-        if decision not in {"approved", "rejected"} or not decided_by.strip():
-            raise ContractValidationError("无效的来源授权决定或确认人。")
-        secret = self.human_portal_secret or ""
-        if len(secret) < 16:
-            raise SourcePolicyChangeRequiresHumanError("来源授权需配置独立可信确认域及签名密钥。")
-
-        def _mutator(state: ProjectWorkspaceState, _conn: sqlite3.Connection) -> tuple[dict[str, Any], str, dict[str, Any]]:
-            req = state.source_policy_requests.get(request_id)
-            if req is None:
-                raise SourcePolicyChangeRequiresHumanError("未知的来源策略申请。")
-            expected = compute_source_policy_signature(secret, project_id, req, decision, decided_by)
-            if not portal_signature or not hmac.compare_digest(expected, portal_signature):
-                raise SourcePolicyChangeRequiresHumanError("来源策略决定缺少有效的可信签名。")
-            if req.status != "pending" or req.base_revision != SourcePolicyEvaluator.revision(state):
-                raise PolicyConflictError("来源策略申请已处理或版本过期；请重新申请。")
-            affected: set[str] = set()
-            revoked: set[str] = set()
-            invalidated_outline = False
             now = datetime.now(UTC).isoformat()
-            if decision == "approved":
-                before = SourcePolicyEvaluator.allowed_ids(state, "cite")
-                state.source_policy = req.proposed_policy.model_copy(deep=True)
-                state.source_policy.updated_by = decided_by
-                state.source_policy.approved_at = now
-                revoked = before - SourcePolicyEvaluator.allowed_ids(state, "cite")
-                denied_evidence = {eid for eid, ev in state.evidence_ledger.items.items() if ev.source_id in revoked}
-                for eid in sorted(denied_evidence):
-                    affected.update(ContextManager.invalidate_evidence_dependents(state, eid, "source_authorization_revoked"))
-                # Outline-only assignments also bind source authority, even before any draft exists.
-                invalidated_outline = any(denied_evidence.intersection(n.assigned_evidence_ids) for n in state.outline_graph.nodes)
-                if invalidated_outline:
-                    for key in ("outline", "final_draft", "final_draft:global"):
-                        app = state.approvals.get(key)
-                        if app and app.status == "approved":
-                            app.status = "invalidated_by_change"
-                            app.invalidation_reason = "Source authorization revoked."
-                    for pending in state.approval_requests.values():
-                        if pending.status == "pending" and pending.artifact_type in {"outline", "final_draft"}:
-                            pending.status = "stale"
-                for other in state.source_policy_requests.values():
-                    if other.request_id != request_id and other.status == "pending":
-                        other.status = "stale"
-            req.status = decision
-            req.decided_by = decided_by
-            req.decided_at = now
-            result = {"request_id": request_id, "status": decision, "policy_revision": SourcePolicyEvaluator.revision(state),
-                      "revoked_source_ids": sorted(revoked), "invalidated_sections": sorted(affected),
-                      "outline_invalidated": invalidated_outline}
-            return result, "Trusted human source policy decision.", {**result, "actor": decided_by, "reason": req.reason}
+            before = SourcePolicyEvaluator.allowed_ids(state, "cite")
+            validated.revision = SourcePolicyEvaluator.revision(state) + 1
+            validated.updated_by = updated_by
+            validated.approved_at = now
+            validated.reason = reason.strip() or "Updated by local user"
+            state.source_policy = validated
+            revoked = before - SourcePolicyEvaluator.allowed_ids(state, "cite")
+            affected: set[str] = set()
+            denied_evidence = {
+                eid for eid, ev in state.evidence_ledger.items.items() if ev.source_id in revoked
+            }
+            for eid in sorted(denied_evidence):
+                affected.update(
+                    ContextManager.invalidate_evidence_dependents(
+                        state, eid, "source_authorization_revoked"
+                    )
+                )
+            invalidated_outline = any(
+                denied_evidence.intersection(n.assigned_evidence_ids)
+                for n in state.outline_graph.nodes
+            )
+            if invalidated_outline:
+                for key in ("outline", "final_draft", "final_draft:global"):
+                    app = state.approvals.get(key)
+                    if app and app.status == "approved":
+                        app.status = "invalidated_by_change"
+                        app.invalidation_reason = "Source authorization revoked."
+                for pending in state.approval_requests.values():
+                    if pending.status == "pending" and pending.artifact_type in {"outline", "final_draft"}:
+                        pending.status = "stale"
+            result = {
+                "project_id": project_id,
+                "policy_revision": SourcePolicyEvaluator.revision(state),
+                "revoked_source_ids": sorted(revoked),
+                "invalidated_sections": sorted(affected),
+                "outline_invalidated": invalidated_outline,
+            }
+            return result, "Updated project source policy.", {**result, "actor": updated_by, "reason": validated.reason}
 
-        return self.store.transact_project(project_id, "trusted_decide_source_policy_change", _mutator)
+        return self.store.transact_project(project_id, "set_source_policy_by_user", _mutator)
 
     def update_profile_settings(
         self,
@@ -806,50 +769,18 @@ class DAFEngine:
 
         return self.store.transact_project(project_id, "get_approval_status", _mutator)
 
-    # 12c. decide_approval_by_human (R2-P0-01 Trusted Human Confirmation Portal ONLY — NOT exposed to Agent tools)
     def decide_approval_by_human(
         self,
         project_id: str,
         approval_request_id: str,
         decision: Literal["approved", "rejected"],
-        human_actor_id: str = "human_user",
+        human_actor_id: str = "local_user",
         decided_by: str | None = None,
-        confirmation_channel: Literal[
-            "trusted_human_portal",
-            "trusted_local_ui",
-            "trusted_host_callback",
-        ] = "trusted_human_portal",
+        confirmation_channel: Literal["local_ui", "local_cli"] = "local_cli",
         comment: str = "",
-        portal_signature: str | None = None,
-        require_portal_signature: bool = False,
     ) -> dict[str, Any]:
-        """Trusted human confirmation entrypoint (isolated from Agent MCP/CLI tool dispatch)."""
+        """Local user confirmation entrypoint (used by local UI and CLI; never exposed to Agent tools)."""
         effective_actor = decided_by or human_actor_id
-        if require_portal_signature or self.human_portal_secret:
-            secret = self.human_portal_secret or os.environ.get("DAF_HUMAN_PORTAL_SECRET") or ""
-            if len(secret) < 16:
-                raise UntrustedApprovalChannelError(
-                    "Trusted human confirmation requires a configured DAF_HUMAN_PORTAL_SECRET (>= 16 chars) and valid HMAC signature."
-                )
-            state_peek = self.store.load_state(project_id)
-            req_peek = state_peek.approval_requests.get(approval_request_id)
-            if req_peek is None:
-                raise UntrustedApprovalChannelError(
-                    f"Unknown approval_request_id '{approval_request_id}'."
-                )
-            expected_sig = compute_human_portal_signature(
-                secret_key=secret,
-                project_id=project_id,
-                approval_request_id=approval_request_id,
-                artifact_hash=req_peek.artifact_hash,
-                decision=decision,
-                human_actor_id=effective_actor,
-            )
-            if not portal_signature or portal_signature != expected_sig:
-                raise UntrustedApprovalChannelError(
-                    "Invalid or missing human portal HMAC signature; ordinary Agents/processes cannot forge human approval.",
-                    details={"project_id": project_id, "approval_request_id": approval_request_id},
-                )
 
         def _mutator(
             state: ProjectWorkspaceState, _conn: sqlite3.Connection
@@ -863,75 +794,12 @@ class DAFEngine:
                 comment=comment,
             )
             summary = (
-                f"Human '{effective_actor}' {decision} request '{approval_request_id}' "
+                f"User '{effective_actor}' {decision} request '{approval_request_id}' "
                 f"via '{confirmation_channel}'."
             )
             return res, summary, res
 
         return self.store.transact_project(project_id, "decide_approval_by_human", _mutator)
-
-    # Internal legacy/test-harness token methods (NOT exposed in Agent MCP/CLI tools)
-    def request_approval_ticket(
-        self,
-        project_id: str,
-        artifact_type: Literal["outline", "section", "final_draft"],
-        target_id: str = "global",
-        channel: Literal[
-            "local_confirmation_token",
-            "trusted_local_cli",
-            "test_harness_token",
-        ] = "local_confirmation_token",
-        ttl_seconds: int = 3600,
-    ) -> dict[str, Any]:
-        """Internal trusted token issuer (retained for internal trusted domain & R1 tests; not exposed as an MCP tool)."""
-        state = self.store.load_state(project_id)
-        norm_target_id, rev, chash = WorkflowEngine.inspect_artifact_for_approval(
-            state, artifact_type, target_id
-        )
-        return self.store.issue_approval_token(
-            project_id=project_id,
-            artifact_type=artifact_type,
-            target_id=norm_target_id,
-            approved_revision=rev,
-            content_hash=chash,
-            channel=channel,
-            ttl_seconds=ttl_seconds,
-        )
-
-    def approve_artifact(
-        self,
-        project_id: str,
-        artifact_type: Literal["outline", "section", "final_draft"],
-        target_id: str = "global",
-        approved_by: str = "human_user",
-        expected_revision: int | None = None,
-        expected_hash: str | None = None,
-        confirmation_token: str | None = None,
-        comment: str = "",
-    ) -> dict[str, Any]:
-        """Internal trusted token consumer (not exposed as an Agent MCP tool)."""
-        def _mutator(
-            state: ProjectWorkspaceState, conn: sqlite3.Connection
-        ) -> tuple[dict[str, Any], str, dict[str, Any]]:
-            res = WorkflowEngine.approve_artifact(
-                state=state,
-                artifact_type=artifact_type,
-                target_id=target_id,
-                approved_by=approved_by,
-                expected_revision=expected_revision,
-                expected_hash=expected_hash,
-                confirmation_token=confirmation_token,
-                store=self.store,
-                conn=conn,
-                comment=comment,
-            )
-            summary = (
-                f"Approved {artifact_type} (target={res['target_id']}, rev={res['approved_revision']}, "
-                f"via={res['confirmed_via']})."
-            )
-            return res, summary, res
-
-        return self.store.transact_project(project_id, "approve_artifact", _mutator)
 
     # 13. get_project_status
     def get_project_status(self, project_id: str) -> dict[str, Any]:
@@ -1499,16 +1367,14 @@ class DAFEngine:
         Strictly blocks any attempt by an Agent to call trusted human confirmation methods or mint tokens.
         """
         payload = dict(params or {})
-        if tool_name in {"trusted_decide_source_policy_change", "update_source_policy", "set_source_policy"}:
-            raise SourcePolicyChangeRequiresHumanError("Agent 只能申请来源授权，不能直接修改策略。")
+        if tool_name in {"set_source_policy_by_user", "update_source_policy", "set_source_policy"}:
+            raise SourcePolicyChangeRequiresHumanError("Agent cannot modify source policy directly; ask the user via local UI or CLI.")
         if tool_name in {
-            "request_approval_ticket",
-            "approve_artifact",
             "decide_approval_by_human",
             "confirm_approval",
         }:
             raise UntrustedApprovalChannelError(
-                f"Tool '{tool_name}' is restricted to the trusted human confirmation domain. "
+                f"Tool '{tool_name}' is restricted to local user confirmation. "
                 "External Agents may only call 'request_approval' and 'get_approval_status'.",
                 details={"attempted_tool": tool_name},
             )
@@ -1518,7 +1384,6 @@ class DAFEngine:
             "get_document_profile": self.get_document_profile,
             "get_task_guidance": self.get_task_guidance,
             "get_source_policy": self.get_source_policy,
-            "propose_source_policy_change": self.propose_source_policy_change,
             "create_project": self.create_project,
             "update_profile_settings": self.update_profile_settings,
             "ingest_sources": self.ingest_sources,

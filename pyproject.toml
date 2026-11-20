@@ -1,13 +1,11 @@
 [project]
 name = "docforge-agent-framework"
-version = "0.1.0"
-description = "DocForge Agent Framework (DAF): Agent-native Document Engineering Framework with MCP, Skill, Context-as-a-Service, Versioned State & Native OMML DOCX Engine"
+version = "0.2.0"
+description = "DocForge Agent Framework (DAF): Local single-user guardrail framework for AI-assisted professional document engineering"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "docxtpl>=0.20.2",
     "fastapi>=0.115.0",
-    "httpx>=0.27.0",
     "lxml>=5.0.0",
     "markitdown>=0.1.0",
     "mcp>=1.0.0",
@@ -22,6 +20,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "httpx>=0.27.0",
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
     "ruff>=0.9.0",

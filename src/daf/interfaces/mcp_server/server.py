@@ -46,10 +46,6 @@ def create_mcp_server(workspace_root: str | Path | None = None, allowed_source_r
         """Read effective Discover/Read/Cite permissions and source authorization requests."""
         return _engine().get_source_policy(project_id)
 
-    @mcp.tool()
-    def propose_source_policy_change(project_id: str, proposed_policy: dict[str, Any], reason: str) -> dict[str, Any]:
-        """Request source authorization. This never changes permissions or confirms a human decision."""
-        return _engine().propose_source_policy_change(project_id, proposed_policy, reason)
 
     @mcp.tool()
     def get_document_profile(profile_id: str) -> dict[str, Any]:

@@ -663,7 +663,7 @@ class ReviewManager:
         # Validate structured checklist_results if provided or required (R3-01 §5.2)
         expected_check_map = {item.check_id: item.question for item in task.checklist_items}
         parsed_checklist_results: list[ChecklistItemResult] = []
-        checklist_mode: str = "legacy_unstructured"
+        checklist_mode: str = "structured_verified"
         eff_checklist_hash: str = ""
 
         if task.requires_structured_checklist and checklist_hash is None:

@@ -65,7 +65,7 @@ class SourceScopeDeniedError(DAFError):
 
 class SourcePolicyChangeRequiresHumanError(DAFError):
     default_code = "SOURCE_POLICY_CHANGE_REQUIRES_HUMAN"
-    default_recommended_tool = "propose_source_policy_change"
+    default_recommended_tool = "get_source_policy"
 
 
 class PolicyConflictError(DAFError):

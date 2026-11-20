@@ -172,7 +172,7 @@ class TaskGuidanceBuilder:
         failures = [
             {
                 "code": "SOURCE_SCOPE_DENIED",
-                "next_tool": "propose_source_policy_change",
+                "next_tool": "get_source_policy",
             },
             {"code": "CONTEXT_STALE", "next_tool": "get_section_context"},
             {"code": "EVIDENCE_UNVERIFIED", "next_tool": "get_source_block"},

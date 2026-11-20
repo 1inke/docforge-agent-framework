@@ -31,7 +31,6 @@ from daf.guidance.profile_guidance import ProfileGuidanceRegistry, ProfileMethod
 from daf.interfaces.cli.main import run_cli_args
 from daf.interfaces.http_api.app import create_http_app
 from daf.interfaces.mcp_server.server import create_mcp_server
-from daf.project_store.store import compute_human_portal_signature
 
 
 def _build_custom_profile(profile_id: str = "custom_spec") -> DocumentProfileContract:
@@ -143,11 +142,10 @@ def test_agent_domain_separation_blocks_privileged_calls(tmp_path: Path) -> None
         engine.call_agent_tool("decide_approval_by_human", {"project_id": "proj_guard"})
 
     with pytest.raises(SourcePolicyChangeRequiresHumanError):
-        engine.call_agent_tool("trusted_decide_source_policy_change", {"project_id": "proj_guard"})
+        engine.call_agent_tool("set_source_policy_by_user", {"project_id": "proj_guard"})
 
 
 def test_end_to_end_template_agnostic_workflow(tmp_path: Path) -> None:
-    secret = "test-portal-secret"
     src_dir = tmp_path / "sources"
     src_dir.mkdir()
     src_file = src_dir / "data.md"
@@ -161,7 +159,6 @@ def test_end_to_end_template_agnostic_workflow(tmp_path: Path) -> None:
         engine = DAFEngine(
             workspace_root=tmp_path / "ws",
             allowed_source_roots=[src_dir],
-            human_portal_secret=secret,
         )
         engine.create_project(
             project_id="proj_e2e",
@@ -222,21 +219,12 @@ def test_end_to_end_template_agnostic_workflow(tmp_path: Path) -> None:
         )
 
         outline_req = engine.request_approval(project_id="proj_e2e", artifact_type="outline")
-        outline_sig = compute_human_portal_signature(
-            secret,
-            "proj_e2e",
-            outline_req["approval_request_id"],
-            outline_req["artifact_hash"],
-            "approved",
-            "human_reviewer",
-        )
         engine.decide_approval_by_human(
             project_id="proj_e2e",
             approval_request_id=outline_req["approval_request_id"],
             decision="approved",
-            decided_by="human_reviewer",
-            portal_signature=outline_sig,
-            require_portal_signature=True,
+            decided_by="local_user",
+            confirmation_channel="local_cli",
         )
 
         for sec_id, body in [
@@ -317,21 +305,12 @@ def test_end_to_end_template_agnostic_workflow(tmp_path: Path) -> None:
             engine.accept_semantic_review(project_id="proj_e2e", task_id=task["task_id"])
 
         final_req = engine.request_approval(project_id="proj_e2e", artifact_type="final_draft")
-        final_sig = compute_human_portal_signature(
-            secret,
-            "proj_e2e",
-            final_req["approval_request_id"],
-            final_req["artifact_hash"],
-            "approved",
-            "human_reviewer",
-        )
         engine.decide_approval_by_human(
             project_id="proj_e2e",
             approval_request_id=final_req["approval_request_id"],
             decision="approved",
-            decided_by="human_reviewer",
-            portal_signature=final_sig,
-            require_portal_signature=True,
+            decided_by="local_user",
+            confirmation_channel="local_cli",
         )
 
         render_res = engine.render_document(project_id="proj_e2e", purpose="release")

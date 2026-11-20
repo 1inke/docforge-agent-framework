@@ -114,19 +114,6 @@ def compute_canonical_request_hash(payload: Any) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def compute_human_portal_signature(
-    secret_key: str,
-    project_id: str,
-    approval_request_id: str,
-    artifact_hash: str,
-    decision: str,
-    human_actor_id: str,
-) -> str:
-    """Compute HMAC-SHA256 signature for out-of-band human confirmation (R2-P0-01)."""
-    msg = f"{project_id}:{approval_request_id}:{artifact_hash}:{decision}:{human_actor_id}".encode("utf-8")
-    return hmac.new(secret_key.encode("utf-8"), msg, hashlib.sha256).hexdigest()
-
-
 class ProjectStore:
     """Manages project workspace directories, SQLite atomic CAS transactions, idempotency, and derived JSON snapshots."""
 
@@ -193,22 +180,6 @@ class ProjectStore:
                 )
                 """
             )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS approval_tokens (
-                    token_hash TEXT PRIMARY KEY,
-                    project_id TEXT NOT NULL,
-                    artifact_type TEXT NOT NULL,
-                    target_id TEXT NOT NULL,
-                    approved_revision INTEGER NOT NULL,
-                    content_hash TEXT NOT NULL,
-                    channel TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    expires_at TEXT NOT NULL,
-                    used_at TEXT
-                )
-                """
-            )
 
             # Check columns for migration from v1/v2 databases
             proj_cols = {
@@ -229,28 +200,6 @@ class ProjectStore:
             if "result_state_version" not in idem_cols:
                 conn.execute(
                     "ALTER TABLE idempotency_records ADD COLUMN result_state_version INTEGER NOT NULL DEFAULT 0"
-                )
-
-            tok_cols = {
-                r["name"] for r in conn.execute("PRAGMA table_info(approval_tokens)").fetchall()
-            }
-            if "token" in tok_cols and "token_hash" not in tok_cols:
-                conn.execute("DROP TABLE approval_tokens")
-                conn.execute(
-                    """
-                    CREATE TABLE approval_tokens (
-                        token_hash TEXT PRIMARY KEY,
-                        project_id TEXT NOT NULL,
-                        artifact_type TEXT NOT NULL,
-                        target_id TEXT NOT NULL,
-                        approved_revision INTEGER NOT NULL,
-                        content_hash TEXT NOT NULL,
-                        channel TEXT NOT NULL,
-                        created_at TEXT NOT NULL,
-                        expires_at TEXT NOT NULL,
-                        used_at TEXT
-                    )
-                    """
                 )
 
             conn.execute(f"PRAGMA user_version = {DB_SCHEMA_VERSION}")
@@ -729,11 +678,7 @@ class ProjectStore:
         comment: str = "",
     ) -> tuple[ApprovalRequest, ApprovalDecision]:
         """Record a human approval/rejection decision inside the trusted confirmation domain (R2-P0-01)."""
-        if confirmation_channel not in {
-            "trusted_human_portal",
-            "trusted_local_ui",
-            "trusted_host_callback",
-        }:
+        if confirmation_channel not in {"local_ui", "local_cli"}:
             raise UntrustedApprovalChannelError(
                 f"Channel '{confirmation_channel}' is not a trusted human confirmation channel.",
                 details={"confirmation_channel": confirmation_channel},
@@ -812,137 +757,6 @@ class ProjectStore:
     # =========================================================================
     # Internal Hashed One-Time Tokens (Trusted Domain / Legacy Test Harness Only)
     # =========================================================================
-
-    def issue_approval_token(
-        self,
-        project_id: str,
-        artifact_type: str,
-        target_id: str,
-        approved_revision: int,
-        content_hash: str,
-        channel: str = "local_confirmation_token",
-        ttl_seconds: int = 3600,
-    ) -> dict[str, Any]:
-        """Internal helper for trusted confirmation domain or explicit test harness.
-        Stores ONLY the SHA-256 hash of the token in SQLite and NEVER writes the token to disk (R2-P0-01 §1.3C).
-        """
-        validate_safe_identifier(project_id, "project_id")
-        if channel == "test_harness_token" and os.environ.get("DAF_ALLOW_TEST_HARNESS_TOKENS", "1") != "1":
-            raise UntrustedApprovalChannelError(
-                "Channel 'test_harness_token' is disabled outside test environments."
-            )
-
-        now = datetime.now(timezone.utc)
-        expires = now + timedelta(seconds=ttl_seconds)
-        token_prefix = "appr_test_" if channel == "test_harness_token" else "appr_usr_"
-        token = f"{token_prefix}{secrets.token_hex(16)}"
-        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-        conn = self._connect(autocommit=True)
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                """
-                INSERT INTO approval_tokens
-                (token_hash, project_id, artifact_type, target_id, approved_revision, content_hash, channel, created_at, expires_at, used_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-                """,
-                (
-                    token_hash,
-                    project_id,
-                    artifact_type,
-                    target_id,
-                    approved_revision,
-                    content_hash,
-                    channel,
-                    now.isoformat(),
-                    expires.isoformat(),
-                ),
-            )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
-        finally:
-            conn.close()
-
-        return {
-            "confirmation_token": token,
-            "project_id": project_id,
-            "artifact_type": artifact_type,
-            "target_id": target_id,
-            "approved_revision": approved_revision,
-            "content_hash": content_hash,
-            "channel": channel,
-            "created_at": now.isoformat(),
-            "expires_at": expires.isoformat(),
-        }
-
-    def consume_approval_token_in_tx(
-        self,
-        conn: sqlite3.Connection,
-        token: str,
-        project_id: str,
-        artifact_type: str,
-        target_id: str,
-        expected_revision: int,
-        expected_hash: str,
-    ) -> str:
-        """Verify and consume a hashed one-time approval token inside an active SQLite transaction."""
-        token_hash = hashlib.sha256((token or "").encode("utf-8")).hexdigest()
-        row = conn.execute(
-            """
-            SELECT token_hash, project_id, artifact_type, target_id, approved_revision, content_hash, channel, expires_at, used_at
-            FROM approval_tokens
-            WHERE token_hash = ?
-            """,
-            (token_hash,),
-        ).fetchone()
-        if row is None:
-            raise UntrustedApprovalChannelError(
-                "Invalid or unknown confirmation_token.",
-                details={"project_id": project_id, "artifact_type": artifact_type},
-            )
-        if row["used_at"] is not None:
-            raise UntrustedApprovalChannelError(
-                "Confirmation token has already been used (one-time use only).",
-                details={"project_id": project_id, "artifact_type": artifact_type},
-            )
-        now = datetime.now(timezone.utc)
-        expires = datetime.fromisoformat(row["expires_at"])
-        if now > expires:
-            raise ApprovalConflictError(
-                "Confirmation token has expired.",
-                code="APPROVAL_STALE",
-                details={"project_id": project_id, "artifact_type": artifact_type},
-            )
-        if (
-            row["project_id"] != project_id
-            or row["artifact_type"] != artifact_type
-            or row["target_id"] != target_id
-        ):
-            raise UntrustedApprovalChannelError(
-                "Confirmation token scope mismatch (project_id, artifact_type, or target_id does not match).",
-                details={"project_id": project_id, "artifact_type": artifact_type, "target_id": target_id},
-            )
-        if int(row["approved_revision"]) != expected_revision or row["content_hash"] != expected_hash:
-            raise ApprovalConflictError(
-                f"Confirmation token was issued for revision {row['approved_revision']} (hash {row['content_hash'][:10]}), "
-                f"but current artifact is at revision {expected_revision} (hash {expected_hash[:10]}).",
-                code="APPROVAL_STALE",
-                details={
-                    "token_revision": int(row["approved_revision"]),
-                    "current_revision": expected_revision,
-                    "token_hash": row["content_hash"],
-                    "current_hash": expected_hash,
-                },
-            )
-
-        conn.execute(
-            "UPDATE approval_tokens SET used_at = ? WHERE token_hash = ?",
-            (now.isoformat(), token_hash),
-        )
-        return str(row["channel"])
 
     def list_projects(self) -> list[dict[str, Any]]:
         with self._connect() as conn:

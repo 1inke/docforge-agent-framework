@@ -1,17 +1,16 @@
-"""Source permissions, legacy views and signed, request-bound policy decisions.
+"""Source scope policy evaluation for local single-user projects.
 
-This module never imports ContextManager: it is used by the low-level readers too.
+This module never imports ContextManager so low-level readers can use it directly.
 """
 
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 from collections.abc import Iterable
 from typing import Any, Literal
 
-from daf.core.contracts import ProjectWorkspaceState, SourcePolicyChangeRequest
+from daf.core.contracts import ProjectWorkspaceState
 from daf.core.errors import SourceScopeDeniedError
 
 
@@ -20,37 +19,12 @@ def canonical_hash(value: Any) -> str:
     return "sha256:" + hashlib.sha256(data.encode("utf-8")).hexdigest()
 
 
-def compute_source_policy_signature(
-    secret: str,
-    project_id: str,
-    request: SourcePolicyChangeRequest,
-    decision: str,
-    decided_by: str = "human_user",
-) -> str:
-    """For trusted callers only. Never expose through an Agent tool."""
-    payload = canonical_hash(
-        {
-            "purpose": "daf.source_policy.v1",
-            "project_id": project_id,
-            "request_id": request.request_id,
-            "base_revision": request.base_revision,
-            "proposed_policy": request.proposed_policy.model_dump(mode="json"),
-            "reason": request.reason,
-            "decision": decision,
-            "decided_by": decided_by,
-        }
-    )
-    return hmac.new(
-        secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256
-    ).hexdigest()
-
-
 class SourcePolicyEvaluator:
-    """V1 shares one allowlist; Discover/Read/Cite remain explicit operations."""
+    """Evaluate Discover/Read/Cite permissions against the project's source policy."""
 
     @staticmethod
     def revision(state: ProjectWorkspaceState) -> int:
-        return state.source_policy.revision if state.source_policy else 0
+        return state.source_policy.revision
 
     @staticmethod
     def allowed_ids(
@@ -61,8 +35,7 @@ class SourcePolicyEvaluator:
             raise ValueError(f"Unknown source operation: {operation}")
         policy = state.source_policy
         all_ids = set(state.source_registry.documents)
-        # Compatibility is limited to local ingested data, never external authority.
-        if policy is None or policy.allowed_source_ids is None:
+        if policy.allowed_source_ids is None:
             return all_ids
         allowed = set(policy.allowed_source_ids)
         if policy.mode != "project_only":
@@ -80,9 +53,8 @@ class SourcePolicyEvaluator:
         cls, state: ProjectWorkspaceState, source_id: str, operation: str = "read"
     ) -> None:
         if not cls.permits(state, source_id, operation):
-            # Deliberately omit path, quote, file name and denied source metadata.
             raise SourceScopeDeniedError(
-                "当前项目来源策略不允许此操作。请改用已授权来源或提交授权申请。",
+                "Current project source policy denies this operation. Ask the user to update source scope.",
                 details={
                     "operation": operation,
                     "policy_revision": cls.revision(state),
@@ -117,18 +89,16 @@ class SourcePolicyEvaluator:
     def public_policy(cls, state: ProjectWorkspaceState) -> dict[str, Any]:
         policy = state.source_policy
         return {
-            "configuration_status": "configured" if policy else "legacy_unconfigured",
+            "configuration_status": "configured",
             "revision": cls.revision(state),
-            "mode": policy.mode if policy else "legacy_unconfigured",
+            "mode": policy.mode,
             "allowed_source_ids": sorted(cls.allowed_ids(state)),
             "permissions": {
                 op: sorted(cls.allowed_ids(state, op))
                 for op in ("discover", "read", "cite")
             },
             "external_lookup_authorized": bool(
-                policy
-                and policy.external_lookup_enabled
-                and policy.mode != "project_only"
+                policy.external_lookup_enabled and policy.mode != "project_only"
             ),
             "external_lookup_available": False,
             "external_lookup_status": "external_lookup_unavailable",
@@ -137,7 +107,7 @@ class SourcePolicyEvaluator:
 
     @classmethod
     def context_view(cls, state: ProjectWorkspaceState) -> ProjectWorkspaceState:
-        """Prevent context APIs from becoming a secondary raw-source read channel."""
+        """Return a filtered state view containing only allowed sources and evidence."""
         allowed = cls.allowed_ids(state)
         if allowed == set(state.source_registry.documents):
             return state
