@@ -1,0 +1,45 @@
+[project]
+name = "docforge-agent-framework"
+version = "0.1.0"
+description = "DocForge Agent Framework (DAF): Agent-native Document Engineering Framework with MCP, Skill, Context-as-a-Service, Versioned State & Native OMML DOCX Engine"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "docxtpl>=0.20.2",
+    "fastapi>=0.115.0",
+    "httpx>=0.27.0",
+    "lxml>=5.0.0",
+    "markitdown>=0.1.0",
+    "mcp>=1.0.0",
+    "pydantic>=2.8.0",
+    "pydantic-settings>=2.4.0",
+    "pypdf>=5.0.0",
+    "python-docx>=1.1.0",
+    "pywin32>=308; sys_platform == 'win32'",
+    "pyyaml>=6.0.0",
+    "uvicorn[standard]>=0.30.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.9.0",
+]
+
+[project.scripts]
+daf = "daf.interfaces.cli.main:main"
+daf-mcp = "daf.interfaces.mcp_server.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/daf"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
